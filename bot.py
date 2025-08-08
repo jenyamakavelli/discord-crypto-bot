@@ -1,4 +1,5 @@
 import discord
+from discord.ext import tasks
 import aiohttp
 import asyncio
 import os
@@ -23,40 +24,34 @@ async def get_prices():
                 raise Exception(f"Unexpected response structure: {data}")
             return data["bitcoin"]["usd"], data["ethereum"]["usd"]
 
+@tasks.loop(minutes=1)
 async def update_prices():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        try:
-            btc_price, eth_price = await get_prices()
+    try:
+        btc_price, eth_price = await get_prices()
 
-            btc_channel = client.get_channel(BTC_CHANNEL_ID)
-            eth_channel = client.get_channel(ETH_CHANNEL_ID)
+        btc_channel = client.get_channel(BTC_CHANNEL_ID)
+        eth_channel = client.get_channel(ETH_CHANNEL_ID)
 
-            if btc_channel:
-                await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
-                print(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
-            else:
-                print("⚠️ BTC канал не найден")
+        if btc_channel:
+            await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
+            print(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
+        else:
+            print("⚠️ BTC канал не найден")
 
-            if eth_channel:
-                await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
-                print(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
-            else:
-                print("⚠️ ETH канал не найден")
+        if eth_channel:
+            await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
+            print(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
+        else:
+            print("⚠️ ETH канал не найден")
 
-        except Exception as e:
-            print(f"⚠️ Ошибка обновления: {e}")
-
-        await asyncio.sleep(60)
+    except Exception as e:
+        print(f"⚠️ Ошибка обновления: {e}")
 
 @client.event
 async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
-
-# Запускаем фоновую задачу внутри setup_hook — правильно для discord.py 2.x
-@client.event
-async def setup_hook():
-    client.loop.create_task(update_prices())
+    if not update_prices.is_running():
+        update_prices.start()
 
 # HTTP сервер для health-check
 async def handle_healthcheck(request):
