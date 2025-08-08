@@ -3,31 +3,27 @@ import aiohttp
 import asyncio
 import os
 
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
 BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-last_btc_price = None
-last_eth_price = None
-
-async def fetch_price(session, coin_id):
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+async def fetch_price(session, coin):
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin}&vs_currencies=usd"
     try:
-        async with session.get(url, timeout=10) as resp:
+        async with session.get(url) as resp:
             if resp.status != 200:
-                print(f"⚠️ Ошибка сети при запросе {coin_id}: HTTP {resp.status}")
+                print(f"⚠️ Ошибка API CoinGecko: {resp.status}")
                 return None
             data = await resp.json()
-            return data.get(coin_id, {}).get("usd")
+            return data[coin]["usd"]
     except Exception as e:
-        print(f"⚠️ Ошибка при запросе {coin_id}: {e}")
+        print(f"⚠️ Ошибка получения цены {coin}: {e}")
         return None
 
-async def update_prices_task():
-    global last_btc_price, last_eth_price
+async def update_prices():
     await client.wait_until_ready()
     async with aiohttp.ClientSession() as session:
         while not client.is_closed():
@@ -35,55 +31,39 @@ async def update_prices_task():
                 btc_price = await fetch_price(session, "bitcoin")
                 eth_price = await fetch_price(session, "ethereum")
 
-                if btc_price is None or eth_price is None:
-                    print("⚠️ Не удалось получить цены, пропускаю обновление")
+                if btc_price is not None:
+                    try:
+                        btc_channel = client.get_channel(BTC_CHANNEL_ID)
+                        await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
+                        print(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
+                    except discord.errors.Forbidden:
+                        print("⚠️ Нет прав на редактирование BTC канала")
+
+                if eth_price is not None:
+                    try:
+                        eth_channel = client.get_channel(ETH_CHANNEL_ID)
+                        await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
+                        print(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
+                    except discord.errors.Forbidden:
+                        print("⚠️ Нет прав на редактирование ETH канала")
+
+            except discord.errors.HTTPException as e:
+                if e.status == 429:
+                    retry_after = int(e.response.headers.get("Retry-After", 10))
+                    print(f"⚠️ Rate limit! Ждём {retry_after} сек.")
+                    await asyncio.sleep(retry_after)
+                    continue
                 else:
-                    btc_channel = client.get_channel(BTC_CHANNEL_ID)
-                    eth_channel = client.get_channel(ETH_CHANNEL_ID)
+                    print(f"⚠️ HTTP ошибка: {e}")
 
-                    if last_btc_price is None or abs(btc_price - last_btc_price) / last_btc_price > 0.001:
-                        if btc_channel:
-                            try:
-                                await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
-                                print(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
-                                last_btc_price = btc_price
-                            except discord.errors.Forbidden:
-                                print("⚠️ Нет прав на редактирование BTC канала")
-                            except discord.errors.HTTPException as e:
-                                if e.status == 429:
-                                    retry_after = float(e.response.headers.get('Retry-After', '60'))
-                                    print(f"⚠️ Rate limited при обновлении BTC. Жду {retry_after} секунд...")
-                                    await asyncio.sleep(retry_after)
-                                    continue
-                                else:
-                                    print(f"⚠️ Ошибка HTTP при обновлении BTC: {e}")
-
-                    if last_eth_price is None or abs(eth_price - last_eth_price) / last_eth_price > 0.001:
-                        if eth_channel:
-                            try:
-                                await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
-                                print(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
-                                last_eth_price = eth_price
-                            except discord.errors.Forbidden:
-                                print("⚠️ Нет прав на редактирование ETH канала")
-                            except discord.errors.HTTPException as e:
-                                if e.status == 429:
-                                    retry_after = float(e.response.headers.get('Retry-After', '60'))
-                                    print(f"⚠️ Rate limited при обновлении ETH. Жду {retry_after} секунд...")
-                                    await asyncio.sleep(retry_after)
-                                    continue
-                                else:
-                                    print(f"⚠️ Ошибка HTTP при обновлении ETH: {e}")
-
-            except Exception as e:
-                print(f"⚠️ Общая ошибка в update_prices: {e}")
-
-            await asyncio.sleep(600)  # 10 минут
+            await asyncio.sleep(120)  # обновляем каждые 2 минуты
 
 @client.event
 async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
-    # Запускаем таск обновления цен здесь, чтобы не использовать client.loop напрямую
-    client.loop.create_task(update_prices_task())
+
+@client.event
+async def setup_hook():
+    client.loop.create_task(update_prices())
 
 client.run(TOKEN)
