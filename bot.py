@@ -26,7 +26,7 @@ async def fetch_price(session, coin_id):
         print(f"⚠️ Ошибка при запросе {coin_id}: {e}")
         return None
 
-async def update_prices():
+async def update_prices_task():
     global last_btc_price, last_eth_price
     await client.wait_until_ready()
     async with aiohttp.ClientSession() as session:
@@ -41,7 +41,6 @@ async def update_prices():
                     btc_channel = client.get_channel(BTC_CHANNEL_ID)
                     eth_channel = client.get_channel(ETH_CHANNEL_ID)
 
-                    # Обновляем BTC только если цена изменилась более чем на 0.1%
                     if last_btc_price is None or abs(btc_price - last_btc_price) / last_btc_price > 0.001:
                         if btc_channel:
                             try:
@@ -59,7 +58,6 @@ async def update_prices():
                                 else:
                                     print(f"⚠️ Ошибка HTTP при обновлении BTC: {e}")
 
-                    # Обновляем ETH только если цена изменилась более чем на 0.1%
                     if last_eth_price is None or abs(eth_price - last_eth_price) / last_eth_price > 0.001:
                         if eth_channel:
                             try:
@@ -80,11 +78,12 @@ async def update_prices():
             except Exception as e:
                 print(f"⚠️ Общая ошибка в update_prices: {e}")
 
-            await asyncio.sleep(600)  # 10 минут между обновлениями
+            await asyncio.sleep(600)  # 10 минут
 
 @client.event
 async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
+    # Запускаем таск обновления цен здесь, чтобы не использовать client.loop напрямую
+    client.loop.create_task(update_prices_task())
 
-client.loop.create_task(update_prices())
 client.run(TOKEN)
