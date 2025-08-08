@@ -11,22 +11,29 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
 def get_price(symbol: str) -> float | None:
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+    mapping = {
+        "BTCUSDT": "bitcoin",
+        "ETHUSDT": "ethereum",
+    }
+    coingecko_id = mapping.get(symbol)
+    if not coingecko_id:
+        print(f"⚠️ Нет ID CoinGecko для символа {symbol}")
+        return None
+
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coingecko_id}&vs_currencies=usd"
     headers = {"User-Agent": "CryptoPriceBot/1.0"}
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        if "price" in data:
-            return float(data["price"])
+        price = data.get(coingecko_id, {}).get("usd")
+        if price is not None:
+            return float(price)
         else:
-            print(f"⚠️ Ошибка API Binance для {symbol}: {data}")
+            print(f"⚠️ Нет цены в ответе CoinGecko для {symbol}: {data}")
             return None
     except requests.RequestException as e:
         print(f"⚠️ Сетевая ошибка при запросе цены {symbol}: {e}")
-        return None
-    except ValueError as e:
-        print(f"⚠️ Ошибка преобразования цены {symbol}: {e}")
         return None
 
 @tasks.loop(minutes=1)
