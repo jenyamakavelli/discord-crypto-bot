@@ -9,6 +9,7 @@ BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 
 intents = discord.Intents.default()
+
 client = discord.Client(intents=intents)
 
 async def get_prices():
@@ -21,9 +22,7 @@ async def get_prices():
             data = await resp.json()
             if "bitcoin" not in data or "ethereum" not in data:
                 raise Exception(f"Unexpected response structure: {data}")
-            btc_price = data["bitcoin"]["usd"]
-            eth_price = data["ethereum"]["usd"]
-            return btc_price, eth_price
+            return data["bitcoin"]["usd"], data["ethereum"]["usd"]
 
 async def update_prices():
     await client.wait_until_ready()
@@ -49,34 +48,30 @@ async def update_prices():
         except Exception as e:
             print(f"⚠️ Ошибка обновления: {e}")
 
-        await asyncio.sleep(60)  # обновлять каждую минуту
+        await asyncio.sleep(60)  # повторять каждую минуту
 
 @client.event
 async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
 
-# Запускаем обновление цен через setup_hook (современный подход)
-class MyClient(discord.Client):
-    async def setup_hook(self):
-        self.bg_task = self.loop.create_task(update_prices())
-
-client = MyClient(intents=intents)
-
-# HTTP сервер для health-check (Koyeb)
+# HTTP сервер для health-check
 async def handle_healthcheck(request):
     return web.Response(text="OK")
 
-app = web.Application()
-app.router.add_get('/', handle_healthcheck)
-
-def run():
-    loop = asyncio.get_event_loop()
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get('/', handle_healthcheck)
     runner = web.AppRunner(app)
-    loop.run_until_complete(runner.setup())
+    await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8000)
-    loop.run_until_complete(site.start())
+    await site.start()
     print("🌐 HTTP health-check сервер запущен на порту 8000")
-    loop.run_until_complete(client.start(TOKEN))
+
+async def main():
+    # Запускаем параллельно http сервер и дискорд бота с обновлением
+    await start_http_server()
+    client.loop.create_task(update_prices())
+    await client.start(TOKEN)
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(main())
