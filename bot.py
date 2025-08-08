@@ -1,69 +1,65 @@
 import discord
-import aiohttp
 import asyncio
 import os
+import aiohttp
+from aiohttp import web
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-
-async def fetch_price(session, coin):
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin}&vs_currencies=usd"
-    try:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                print(f"⚠️ Ошибка API CoinGecko: {resp.status}")
-                return None
-            data = await resp.json()
-            return data[coin]["usd"]
-    except Exception as e:
-        print(f"⚠️ Ошибка получения цены {coin}: {e}")
-        return None
+client = discord.Client(intents=discord.Intents.default())
 
 async def update_prices():
-    await client.wait_until_ready()
-    async with aiohttp.ClientSession() as session:
-        while not client.is_closed():
-            try:
-                btc_price = await fetch_price(session, "bitcoin")
-                eth_price = await fetch_price(session, "ethereum")
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.coindesk.com/v1/bpi/currentprice.json") as resp:
+                    data = await resp.json()
+                    btc_price = f"${float(data['bpi']['USD']['rate'].replace(',', '')):,.2f}"
 
-                if btc_price is not None:
-                    try:
-                        btc_channel = client.get_channel(BTC_CHANNEL_ID)
-                        await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
-                        print(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
-                    except discord.errors.Forbidden:
-                        print("⚠️ Нет прав на редактирование BTC канала")
+                # ETH API
+                async with session.get("https://api.coinbase.com/v2/prices/ETH-USD/spot") as resp:
+                    data = await resp.json()
+                    eth_price = f"${float(data['data']['amount']):,.2f}"
 
-                if eth_price is not None:
-                    try:
-                        eth_channel = client.get_channel(ETH_CHANNEL_ID)
-                        await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
-                        print(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
-                    except discord.errors.Forbidden:
-                        print("⚠️ Нет прав на редактирование ETH канала")
+            btc_channel = client.get_channel(BTC_CHANNEL_ID)
+            eth_channel = client.get_channel(ETH_CHANNEL_ID)
 
-            except discord.errors.HTTPException as e:
-                if e.status == 429:
-                    retry_after = int(e.response.headers.get("Retry-After", 10))
-                    print(f"⚠️ Rate limit! Ждём {retry_after} сек.")
-                    await asyncio.sleep(retry_after)
-                    continue
-                else:
-                    print(f"⚠️ HTTP ошибка: {e}")
+            if btc_channel:
+                await btc_channel.edit(name=f"BTC: {btc_price}")
+                print(f"✅ Обновлено имя BTC канала: BTC: {btc_price}")
+            if eth_channel:
+                await eth_channel.edit(name=f"ETH: {eth_price}")
+                print(f"✅ Обновлено имя ETH канала: ETH: {eth_price}")
 
-            await asyncio.sleep(120)  # обновляем каждые 2 минуты
+        except Exception as e:
+            print(f"⚠️ Ошибка обновления: {e}")
+
+        await asyncio.sleep(120)  # каждые 2 минуты
 
 @client.event
 async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
+    asyncio.create_task(update_prices())
 
-@client.event
-async def setup_hook():
-    client.loop.create_task(update_prices())
+# ---- HTTP Health Check ----
+async def health(request):
+    return web.Response(text="OK", status=200)
 
-client.run(TOKEN)
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 HTTP health-check сервер запущен на порту {port}")
+
+async def main():
+    await start_web_server()
+    await client.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
