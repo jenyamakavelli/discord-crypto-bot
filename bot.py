@@ -36,7 +36,7 @@ def get_price(symbol: str) -> float | None:
         print(f"⚠️ Сетевая ошибка при запросе цены {symbol}: {e}")
         return None
 
-@tasks.loop(minutes=3)
+@tasks.loop(minutes=4)
 async def update_prices():
     btc_price = get_price("BTCUSDT")
     eth_price = get_price("ETHUSDT")
