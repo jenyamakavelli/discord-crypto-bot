@@ -9,7 +9,6 @@ BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 
 intents = discord.Intents.default()
-
 client = discord.Client(intents=intents)
 
 async def get_prices():
@@ -48,11 +47,16 @@ async def update_prices():
         except Exception as e:
             print(f"⚠️ Ошибка обновления: {e}")
 
-        await asyncio.sleep(60)  # повторять каждую минуту
+        await asyncio.sleep(60)
 
 @client.event
 async def on_ready():
     print(f"✅ Бот запущен как {client.user}")
+
+# Запускаем фоновую задачу внутри setup_hook — правильно для discord.py 2.x
+@client.event
+async def setup_hook():
+    client.loop.create_task(update_prices())
 
 # HTTP сервер для health-check
 async def handle_healthcheck(request):
@@ -68,9 +72,7 @@ async def start_http_server():
     print("🌐 HTTP health-check сервер запущен на порту 8000")
 
 async def main():
-    # Запускаем параллельно http сервер и дискорд бота с обновлением
     await start_http_server()
-    client.loop.create_task(update_prices())
     await client.start(TOKEN)
 
 if __name__ == "__main__":
