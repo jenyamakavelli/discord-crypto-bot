@@ -3,9 +3,9 @@ import requests
 import asyncio
 import os
 
-TOKEN = os.getenv("MTQwMzQxOTUwNjA0MjM0MzU5NQ.GZTGk4.-fhN_Wy-f_E-RcG5fZo5XazY3vOXVdl7Yy_-EU")
-BTC_CHANNEL_ID = int(os.getenv("1403424694174224455"))
-ETH_CHANNEL_ID = int(os.getenv("1403425091634860145"))
+TOKEN = os.getenv("TOKEN")
+BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
+ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
