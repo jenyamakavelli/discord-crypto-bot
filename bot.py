@@ -38,7 +38,7 @@ async def update_channel_name(channel_id, name):
         await channel.edit(name=name)
 
 # ------------------ ОБНОВЛЕНИЕ ЦЕН ------------------
-@tasks.loop(minutes=3)
+@tasks.loop(minutes=5)
 async def update_prices():
     log.info("🔄 Начинаю обновление цен")
     async with aiohttp.ClientSession() as session:
