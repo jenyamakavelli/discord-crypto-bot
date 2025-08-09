@@ -20,7 +20,6 @@ FNG_CHANNEL_ID = int(os.getenv("FNG_CHANNEL_ID"))
 BTC_VOL_CHANNEL_ID = int(os.getenv("BTC_VOL_CHANNEL_ID"))
 ETH_VOL_CHANNEL_ID = int(os.getenv("ETH_VOL_CHANNEL_ID"))
 SESSIONS_CHANNEL_ID = int(os.getenv("SESSIONS_CHANNEL_ID"))
-NEWS_CHANNEL_ID = int(os.getenv("NEWS_CHANNEL_ID"))
 HEALTH_URL = os.getenv("HEALTH_URL")  # Для Koyeb Ping
 # =====================================
 
@@ -47,8 +46,7 @@ last_values = {
     "eth_vol": None,
     "fng": None,
     "sessions_msg_id": None,
-    "news_msg_id": None,
-    # Add more if needed
+    "sessions_msg_content": None,
 }
 
 # ===== Async HTTP fetch with retry and backoff for rate limits =====
@@ -118,209 +116,193 @@ async def update_channel_if_changed(channel_id, new_name, key):
             except discord.HTTPException as e:
                 logger.error(f"Ошибка обновления канала {channel_id}: {e}")
 
-# ===== Market Sessions Logic =====
+# ===== Market sessions handling =====
 
+# Майами таймзона для расчётов
 MIAMI_TZ = pytz.timezone("America/New_York")
 
-def get_miami_now():
-    return datetime.now(MIAMI_TZ).replace(second=0, microsecond=0)
-
-def get_next_weekday(dt, weekday):
-    days_ahead = weekday - dt.weekday()
-    if days_ahead <= 0:
-        days_ahead += 7
-    return dt + timedelta(days=days_ahead)
-
 def get_market_status(market_name, now_miami):
-    # Все рынки закрыты с пятницы 17:00 по Майами до воскресенья 17:00 по Майами
-    # Открыты в остальное время
-    weekday = now_miami.weekday()
-    hour = now_miami.hour
-    minute = now_miami.minute
+    """
+    Рассчитывает статус рынка (open/closed) и время до закрытия или открытия.
+    Учитывает выходные:
+      - Рынки закрыты с пятницы 17:00 до воскресенья 17:00 (по Майами).
+      - Рынки открыты в другое время.
+    """
+    # Ближайшая пятница 17:00
+    days_until_friday = (4 - now_miami.weekday()) % 7
+    this_friday_17 = (now_miami + timedelta(days=days_until_friday)).replace(hour=17, minute=0, second=0, microsecond=0)
 
-    # Пятница 17:00 Майами
-    friday_17 = now_miami.replace(hour=17, minute=0, second=0, microsecond=0)
-    friday_close = get_next_weekday(friday_17, 4)  # пятница
+    # Ближайшее воскресенье 17:00
+    days_until_sunday = (6 - now_miami.weekday()) % 7
+    this_sunday_17 = (now_miami + timedelta(days=days_until_sunday)).replace(hour=17, minute=0, second=0, microsecond=0)
 
-    # Воскресенье 17:00 Майами
-    sunday_17 = now_miami.replace(hour=17, minute=0, second=0, microsecond=0)
-    sunday_open = get_next_weekday(sunday_17, 6)  # воскресенье
+    # Выходные: пятница 17:00 <= now < воскресенье 17:00
+    if this_friday_17 <= now_miami < this_sunday_17:
+        status = "closed"
+        time_to_open = this_sunday_17 - now_miami
+        return status, time_to_open
 
-    # Если сейчас в период закрытия выходных (пт 17:00 - вс 17:00)
-    if friday_close <= now_miami < sunday_open:
-        delta = sunday_open - now_miami
-        return "closed", delta
+    # В остальное время — открыто, время до пятницы 17:00
+    # Если сегодня пятница и после 17:00, то считаем пятницу следующей недели
+    if now_miami >= this_friday_17:
+        this_friday_17 += timedelta(days=7)
 
-    # Если воскресенье до 17:00
-    if weekday == 6 and now_miami < sunday_open:
-        delta = sunday_open - now_miami
-        return "closed", delta
+    status = "open"
+    time_to_close = this_friday_17 - now_miami
+    return status, time_to_close
 
-    # В другое время открыт
-    # Следующее закрытие пятница 17:00
-    next_friday = get_next_weekday(now_miami, 4).replace(hour=17, minute=0, second=0, microsecond=0)
-    delta = next_friday - now_miami
-    return "open", delta
-
-def format_timedelta(delta: timedelta):
-    days = delta.days
-    hours, remainder = divmod(delta.seconds, 3600)
+def format_timedelta(delta):
+    total_seconds = int(delta.total_seconds())
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
     parts = []
     if days > 0:
         parts.append(f"{days}d")
-    parts.append(f"{hours}h")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
     parts.append(f"{minutes}m")
     return " ".join(parts)
 
-def get_session_status_emoji(status: str, delta: timedelta):
-    # 🟢 open, 🔴 closed, 🟡 скоро открытие (менее 1 часа)
+def get_session_status_emoji(status, relative_seconds):
     if status == "open":
         return "🟢"
     elif status == "closed":
-        if delta.total_seconds() <= 3600:
+        # Если открытие скоро — меньше часа, желтый
+        if relative_seconds <= 3600:
             return "🟡"
-        else:
-            return "🔴"
-    else:
-        return ""
+        return "🔴"
+    return ""
 
-def format_updated_since(last_update_dt: datetime, now_dt: datetime):
-    delta = now_dt - last_update_dt
-    seconds = int(delta.total_seconds())
+def format_updated_since(last_update_dt, now_dt):
+    diff = now_dt - last_update_dt
+    seconds = diff.total_seconds()
     if seconds < 60:
         return "обновлено только что"
     elif seconds < 3600:
-        mins = seconds // 60
+        mins = int(seconds // 60)
         return f"обновлено {mins} мин назад"
-    elif seconds < 86400:
-        hours = seconds // 3600
-        mins = (seconds % 3600) // 60
-        if mins == 0:
-            return f"обновлено {hours} ч назад"
-        else:
-            return f"обновлено {hours} ч {mins} мин назад"
     else:
-        days = seconds // 86400
-        hours = (seconds % 86400) // 3600
-        return f"обновлено {days} д {hours} ч назад"
+        hours = int(seconds // 3600)
+        return f"обновлено {hours} ч назад"
 
 async def update_sessions_message():
-    channel = bot.get_channel(SESSIONS_CHANNEL_ID)
-    if channel is None:
-        logger.error("SESSIONS_CHANNEL_ID неверен или бот не имеет доступа")
-        return
-
-    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc, second=0, microsecond=0)
-    now_miami = get_miami_now()
+    now_utc = datetime.now(timezone.utc)
+    now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
 
     markets = ["Tokyo", "London", "New York"]
-    sessions_lines = []
+    sessions_info = {}
 
     for market in markets:
         status, delta = get_market_status(market, now_miami)
-        emoji = get_session_status_emoji(status, delta)
-        time_str = format_timedelta(delta)
-        if status == "open":
-            sessions_lines.append(f"{emoji} {market}: open — closes in {time_str}")
-        else:
-            sessions_lines.append(f"{emoji} {market}: closed — opens in {time_str}")
+        sessions_info[market] = {
+            "status": status,
+            "relative": int(delta.total_seconds()),
+            "formatted_delta": format_timedelta(delta),
+        }
 
-    # Для строки обновления показываем "обновлено N мин назад"
-    # Используем last update time, храним в last_values
-    last_update_dt = last_values.get("sessions_last_update")
-    if last_update_dt is None:
-        last_update_dt = now_utc
-    updated_text = format_updated_since(last_update_dt, now_utc)
+    updated_text = format_updated_since(last_values.get("sessions_last_update", now_utc), now_utc)
+    header = f"🕒 Market sessions (relative times, UTC) — {updated_text}\n\n"
 
-    message_content = (
-        f"🕒 Market sessions (relative times, UTC) — {updated_text}\n\n"
-        + "\n".join(sessions_lines)
-        + "\n\n⚠️ Countdown is relative (D days Hh Mm). Gap alerts posted for session opens."
-    )
+    lines = []
+    for market in markets:
+        info = sessions_info[market]
+        emoji = get_session_status_emoji(info["status"], info["relative"])
+        status_text = "open — closes in" if info["status"] == "open" else "closed — opens in"
+        line = f"{emoji} {market}: {status_text} {info['formatted_delta']}"
+        lines.append(line)
 
-    # Отправляем или редактируем сообщение сессий
-    if last_values.get("sessions_msg_id"):
-        try:
-            msg = await channel.fetch_message(last_values["sessions_msg_id"])
-            await msg.edit(content=message_content)
-        except discord.NotFound:
-            msg = await channel.send(message_content)
+    footer = "\n\n⚠️ Countdown is relative (D days Hh Mm). Gap alerts posted for session opens."
+    message = header + "\n".join(lines) + footer
+
+    channel = bot.get_channel(SESSIONS_CHANNEL_ID)
+    if channel is None:
+        logger.warning("Sessions channel not found")
+        return
+
+    try:
+        # Проверяем есть ли сохранённое сообщение сессий
+        msg_id = last_values.get("sessions_msg_id")
+        msg = None
+        if msg_id:
+            try:
+                msg = await channel.fetch_message(msg_id)
+            except discord.NotFound:
+                msg = None
+        if msg is None:
+            # Отправляем новое сообщение
+            msg = await channel.send(message)
             last_values["sessions_msg_id"] = msg.id
-    else:
-        msg = await channel.send(message_content)
-        last_values["sessions_msg_id"] = msg.id
-
-    last_values["sessions_last_update"] = now_utc
-    logger.info("Sessions message updated")
+            last_values["sessions_msg_content"] = message
+            last_values["sessions_last_update"] = now_utc
+            logger.info("Sessions message sent (new)")
+        else:
+            # Обновляем сообщение если содержимое изменилось
+            if message != last_values.get("sessions_msg_content"):
+                await msg.edit(content=message)
+                last_values["sessions_msg_content"] = message
+                last_values["sessions_last_update"] = now_utc
+                logger.info("Sessions message updated")
+    except Exception as e:
+        logger.error(f"Failed to update sessions message: {e}")
 
 # ===== Background tasks =====
 
 @tasks.loop(minutes=6)
 async def update_prices():
     async with aiohttp.ClientSession() as session:
-        btc_price, _ = await get_price_and_volume(session, "bitcoin")
-        eth_price, _ = await get_price_and_volume(session, "ethereum")
+        btc_price, btc_vol = await get_price_and_volume(session, "bitcoin")
+        eth_price, eth_vol = await get_price_and_volume(session, "ethereum")
 
         if btc_price is not None:
-            name = f"BTC: ${btc_price:,.2f}"
-            await update_channel_if_changed(BTC_PRICE_CHANNEL_ID, name, "btc_price")
+            await update_channel_if_changed(BTC_PRICE_CHANNEL_ID, f"BTC: ${btc_price:,.2f}", "btc_price")
         if eth_price is not None:
-            name = f"ETH: ${eth_price:,.2f}"
-            await update_channel_if_changed(ETH_PRICE_CHANNEL_ID, name, "eth_price")
-
-@tasks.loop(minutes=17)
-async def update_volumes():
-    async with aiohttp.ClientSession() as session:
-        _, btc_vol = await get_price_and_volume(session, "bitcoin")
-        _, eth_vol = await get_price_and_volume(session, "ethereum")
+            await update_channel_if_changed(ETH_PRICE_CHANNEL_ID, f"ETH: ${eth_price:,.2f}", "eth_price")
 
         if btc_vol is not None:
-            name = f"BTC Vol: {format_volume(btc_vol)}"
-            await update_channel_if_changed(BTC_VOL_CHANNEL_ID, name, "btc_vol")
+            await update_channel_if_changed(BTC_VOL_CHANNEL_ID, f"BTC Vol: {format_volume(btc_vol)}", "btc_vol")
         if eth_vol is not None:
-            name = f"ETH Vol: {format_volume(eth_vol)}"
-            await update_channel_if_changed(ETH_VOL_CHANNEL_ID, name, "eth_vol")
+            await update_channel_if_changed(ETH_VOL_CHANNEL_ID, f"ETH Vol: {format_volume(eth_vol)}", "eth_vol")
 
 @tasks.loop(minutes=43)
 async def update_fng():
     async with aiohttp.ClientSession() as session:
-        fng_index = await get_fear_and_greed(session)
-        if fng_index is not None:
-            name = f"Fear & Greed: {fng_index}"
-            await update_channel_if_changed(FNG_CHANNEL_ID, name, "fng")
+        fng = await get_fear_and_greed(session)
+        if fng is not None:
+            await update_channel_if_changed(FNG_CHANNEL_ID, f"Fear & Greed: {fng}", "fng")
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=17)
 async def update_sessions():
     try:
         await update_sessions_message()
     except Exception as e:
-        logger.error(f"Ошибка в update_sessions: {e}")
+        logger.error(f"Error in update_sessions task: {e}")
 
-@tasks.loop(minutes=5)
-async def update_health():
-    if HEALTH_URL:
-        try:
-            async with aiohttp.ClientSession() as session:
-                await session.get(HEALTH_URL, timeout=10)
-            logger.info("✅ HEALTH URL pinged")
-        except Exception as e:
-            logger.warning(f"Health ping failed: {e}")
+@tasks.loop(minutes=30)
+async def health_ping():
+    if not HEALTH_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(HEALTH_URL) as resp:
+                if resp.status == 200:
+                    logger.info("✅ HEALTH URL pinged")
+                else:
+                    logger.warning(f"Health ping returned status {resp.status}")
+    except Exception as e:
+        logger.error(f"Health ping failed: {e}")
 
-# ===== Bot events =====
-
+# ===== Startup =====
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot started as {bot.user}")
     update_prices.start()
-    update_volumes.start()
     update_fng.start()
     update_sessions.start()
-    update_health.start()
+    health_ping.start()
 
-# ===== Run bot =====
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN не установлен в переменных окружения")
+        logger.error("DISCORD_TOKEN not set")
         exit(1)
     bot.run(DISCORD_TOKEN)
