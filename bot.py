@@ -216,7 +216,7 @@ async def update_sessions_message():
     # Формат времени обновления
     updated_text = format_updated_since(last_update, now) if last_update else f"обновлено {now.strftime('%Y-%m-%d %H:%M UTC')}"
 
-    lines = [f"🕒 Market sessions (relative times, UTC) — {updated_text}", ""]
+    lines = [f"🕒 Рыночные сессии — {updated_text}", ""]
 
     for name in ["Tokyo", "London", "New York"]:
         info = get_session_status(now, name)
