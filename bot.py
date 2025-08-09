@@ -38,129 +38,149 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# ===== Shared state =====
+# ===== Shared state for last values to avoid redundant updates =====
 last_values = {
+    "btc_price": None,
+    "eth_price": None,
+    "btc_vol": None,
+    "eth_vol": None,
+    "fng": None,
     "sessions_msg_id": None,
     "sessions_msg_content": None,
     "sessions_last_update": None,
 }
 
-# ===== Constants & Timezones =====
-MIAMI_TZ = pytz.timezone("America/New_York")
-LONDON_TZ = pytz.timezone("Europe/London")
-TOKYO_TZ = pytz.timezone("Asia/Tokyo")
+# ===== Async HTTP fetch with retry and backoff for rate limits =====
+async def fetch_json(session, url, max_retries=5):
+    backoff = 1
+    for attempt in range(max_retries):
+        try:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 429:
+                    retry_after = int(resp.headers.get("Retry-After", backoff))
+                    logger.warning(f"429 rate limited by API, sleeping {retry_after} sec")
+                    await asyncio.sleep(retry_after)
+                    backoff = min(backoff * 2, 60)
+                    continue
+                resp.raise_for_status()
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"HTTP error {e} on attempt {attempt+1} for URL {url}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+    logger.error(f"Failed to fetch {url} after {max_retries} attempts")
+    return None
 
-# ===== Market session schedule (время Майами) =====
-# Все времена в local time Майами
-
-# Время закрытия рынков перед выходными (Пятница 17:00)
-MARKET_CLOSE_TIME = {"hour": 17, "minute": 0}
-
-# Время открытия рынков после выходных (Воскресенье 17:00)
-MARKET_OPEN_TIME = {"hour": 17, "minute": 0}
-
-# Часы работы сессий (в часах) - ориентировочно
-SESSIONS = {
-    "Tokyo": {
-        "open_hour": 19,   # 7 PM Майами время = 8 AM Tokyo следующего дня (примерно)
-        "close_hour": 4,   # 4 AM Майами (следующий день)
-        "timezone": TOKYO_TZ,
-    },
-    "London": {
-        "open_hour": 3,    # 3 AM Майами (примерно 8 AM London)
-        "close_hour": 12,  # 12 PM Майами (примерно 5 PM London)
-        "timezone": LONDON_TZ,
-    },
-    "New York": {
-        "open_hour": 8,    # 8 AM Майами
-        "close_hour": 17,  # 5 PM Майами
-        "timezone": MIAMI_TZ,
-    },
-}
-
-def get_next_weekday(dt, weekday):
-    """
-    Возвращает datetime ближайшего будущего дня недели (0=Понедельник,...,6=Воскресенье)
-    Если dt - нужный день, вернет dt.
-    """
-    days_ahead = (weekday - dt.weekday()) % 7
-    return dt + timedelta(days=days_ahead)
-
-def get_market_open_close_dt(market, now_miami):
-    """
-    Возвращает даты открытия и закрытия сессии в datetime (Майами), с учётом
-    работы сессий внутри недели.
-    """
-    session = SESSIONS[market]
-
-    # Если рынок сейчас в выходных (пятница 17:00 - воскресенье 17:00), возвращаем None для open/close
-
-    friday_close = now_miami.replace(hour=MARKET_CLOSE_TIME["hour"], minute=MARKET_CLOSE_TIME["minute"], second=0, microsecond=0)
-    friday_close = get_next_weekday(friday_close, 4)  # Ближайшая пятница
-
-    sunday_open = now_miami.replace(hour=MARKET_OPEN_TIME["hour"], minute=MARKET_OPEN_TIME["minute"], second=0, microsecond=0)
-    sunday_open = get_next_weekday(sunday_open, 6)  # Ближайшее воскресенье
-
-    # Если сейчас после пятницы 17:00 и до воскресенья 17:00 — рынки закрыты
-    if friday_close <= now_miami < sunday_open:
+# ===== Data fetchers =====
+async def get_price_and_volume(session, coin_id):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+    data = await fetch_json(session, url)
+    if not data:
+        return None, None
+    try:
+        price = data["market_data"]["current_price"]["usd"]
+        volume = data["market_data"]["total_volume"]["usd"]
+        return price, volume
+    except KeyError:
+        logger.warning(f"Malformed data from CoinGecko for {coin_id}")
         return None, None
 
-    # Определяем время открытия и закрытия для текущей недели
+async def get_fear_and_greed(session):
+    url = "https://api.alternative.me/fng/"
+    data = await fetch_json(session, url)
+    if not data:
+        return None
+    try:
+        return int(data["data"][0]["value"])
+    except (KeyError, IndexError, ValueError):
+        logger.warning("Malformed Fear & Greed Index data")
+        return None
 
-    # Даты открытия и закрытия для текущего дня
-    open_dt = now_miami.replace(hour=session["open_hour"], minute=0, second=0, microsecond=0)
-    close_dt = now_miami.replace(hour=session["close_hour"], minute=0, second=0, microsecond=0)
-
-    # Для сессий с "закрытием" в следующем дне (Tokyo)
-    if session["close_hour"] < session["open_hour"]:
-        # close_dt переносим на следующий день
-        close_dt += timedelta(days=1)
-
-    # Если время открытия в прошлом, берём открытие следующего дня (рабочего)
-    if open_dt <= now_miami:
-        open_dt += timedelta(days=1)
-        close_dt += timedelta(days=1)
-
-    return open_dt, close_dt
-
-def get_session_status(market, now_miami):
-    """
-    Возвращает статус (open/closed) и timedelta до открытия/закрытия
-    """
-
-    friday_close = now_miami.replace(hour=MARKET_CLOSE_TIME["hour"], minute=MARKET_CLOSE_TIME["minute"], second=0, microsecond=0)
-    friday_close = get_next_weekday(friday_close, 4)  # ближайшая пятница 17:00
-
-    sunday_open = now_miami.replace(hour=MARKET_OPEN_TIME["hour"], minute=MARKET_OPEN_TIME["minute"], second=0, microsecond=0)
-    sunday_open = get_next_weekday(sunday_open, 6)  # ближайшее воскресенье 17:00
-
-    # Если сейчас выходные - закрыты все рынки
-    if friday_close <= now_miami < sunday_open:
-        # Открытие для Токио только в воскресенье 17:00
-        if market == "Tokyo":
-            time_to_open = sunday_open - now_miami
-            return "closed", time_to_open
-
-        # London и New York — закрыты в выходные, откроются в воскресенье 17:00
-        time_to_open = sunday_open - now_miami
-        return "closed", time_to_open
-
-    # Если время в будние, считаем локальный статус
-
-    open_dt, close_dt = get_market_open_close_dt(market, now_miami)
-
-    if open_dt is None or close_dt is None:
-        # Если None, значит выходные
-        return "closed", sunday_open - now_miami
-
-    if open_dt <= now_miami < close_dt:
-        # Рынок открыт
-        time_to_close = close_dt - now_miami
-        return "open", time_to_close
+# ===== Helper to format volume =====
+def format_volume(vol):
+    if vol >= 1_000_000_000:
+        return f"${vol/1_000_000_000:.1f}B"
+    elif vol >= 1_000_000:
+        return f"${vol/1_000_000:.1f}M"
     else:
-        # Рынок закрыт, ждем открытия
-        time_to_open = open_dt - now_miami
-        return "closed", time_to_open
+        return f"${vol:,.0f}"
+
+# ===== Update channel only if value changed =====
+async def update_channel_if_changed(channel_id, new_name, key):
+    if last_values.get(key) != new_name:
+        channel = bot.get_channel(channel_id)
+        if channel:
+            try:
+                await channel.edit(name=new_name)
+                last_values[key] = new_name
+                logger.info(f"Обновлен канал {channel_id}: {new_name}")
+            except discord.HTTPException as e:
+                logger.error(f"Ошибка обновления канала {channel_id}: {e}")
+
+# ===== Market sessions handling =====
+MIAMI_TZ = pytz.timezone("America/New_York")
+
+def get_market_times(now_miami):
+    # Пятница 17:00 Майами (начало выходных)
+    days_until_friday = (4 - now_miami.weekday()) % 7
+    friday_17 = (now_miami + timedelta(days=days_until_friday)).replace(hour=17, minute=0, second=0, microsecond=0)
+    if now_miami.weekday() == 4 and now_miami.hour >= 17:
+        friday_17 += timedelta(days=7)
+
+    # Воскресенье 17:00 Майами (конец выходных, начало сессий)
+    days_until_sunday = (6 - now_miami.weekday()) % 7
+    sunday_17 = (now_miami + timedelta(days=days_until_sunday)).replace(hour=17, minute=0, second=0, microsecond=0)
+    if now_miami.weekday() == 6 and now_miami.hour >= 17:
+        sunday_17 += timedelta(days=7)
+
+    return friday_17, sunday_17
+
+def get_session_status(session_name, now_miami):
+    friday_17, sunday_17 = get_market_times(now_miami)
+
+    # Определяем время открытия/закрытия сессий по Майами времени (примерное)
+    # Asia (Tokyo): открывается в воскресенье 17:00, закрывается в пятницу 17:00
+    # London: открывается в воскресенье 22:00, закрывается в пятницу 21:00
+    # New York: открывается в воскресенье 17:00, закрывается в пятницу 17:00
+
+    if session_name == "Tokyo":
+        open_time = sunday_17
+        close_time = friday_17
+    elif session_name == "London":
+        open_time = sunday_17 + timedelta(hours=5)  # 22:00 Sunday
+        close_time = friday_17 + timedelta(hours=4)  # 21:00 Friday
+    elif session_name == "New York":
+        open_time = sunday_17
+        close_time = friday_17
+    else:
+        return "closed", timedelta(0)
+
+    # Если сейчас между пятницей 17:00 и воскресеньем 17:00 — рынок закрыт
+    if friday_17 <= now_miami < sunday_17:
+        status = "closed"
+        time_to_open = open_time - now_miami
+        return status, time_to_open
+
+    # Если сейчас после открытия и до закрытия — открыт
+    # Для сессий с "переходом" через неделю учитываем, что close_time < open_time (закрытие на следующей неделе)
+    if close_time < open_time:
+        close_time += timedelta(days=7)
+
+    if open_time <= now_miami < close_time:
+        status = "open"
+        time_to_close = close_time - now_miami
+        return status, time_to_close
+
+    # Если сейчас до открытия, но не в выходные
+    if now_miami < open_time:
+        status = "closed"
+        time_to_open = open_time - now_miami
+        return status, time_to_open
+
+    # В остальных случаях считаем закрытым и считаем до открытия через неделю
+    status = "closed"
+    time_to_open = open_time + timedelta(days=7) - now_miami
+    return status, time_to_open
 
 def format_timedelta(delta):
     total_seconds = int(delta.total_seconds())
@@ -177,17 +197,17 @@ def format_timedelta(delta):
     parts.append(f"{minutes}m")
     return " ".join(parts)
 
-def get_session_status_emoji(status, seconds_until):
+def get_session_status_emoji(status, relative_seconds):
     if status == "open":
         return "🟢"
-    if status == "closed":
-        if seconds_until <= 3600:
+    elif status == "closed":
+        if relative_seconds <= 3600:
             return "🟡"
         return "🔴"
     return ""
 
 def format_updated_since(last_update_dt, now_dt):
-    if not last_update_dt:
+    if last_update_dt is None:
         return "обновлено только что"
     diff = now_dt - last_update_dt
     seconds = diff.total_seconds()
@@ -216,7 +236,7 @@ async def update_sessions_message():
         }
 
     updated_text = format_updated_since(last_values.get("sessions_last_update"), now_utc)
-    header = f"🕒 Market sessions (relative times, America/New_York) — {updated_text}\n\n"
+    header = f"🕒 Market sessions (relative times, UTC) — {updated_text}\n\n"
 
     lines = []
     for market in markets:
@@ -230,7 +250,7 @@ async def update_sessions_message():
     message = header + "\n".join(lines) + footer
 
     channel = bot.get_channel(SESSIONS_CHANNEL_ID)
-    if not channel:
+    if channel is None:
         logger.warning("Sessions channel not found")
         return
 
@@ -257,34 +277,30 @@ async def update_sessions_message():
     except Exception as e:
         logger.error(f"Failed to update sessions message: {e}")
 
-# ===== Остальной твой код (fetchers, обновления каналов, таски, on_ready и т.п.) =====
+# ===== Background tasks =====
 
-# Например:
-# async def update_prices(): ...
-# async def update_fng(): ...
-# async def health_ping(): ...
-# и старт задач в on_ready
+@tasks.loop(minutes=6)
+async def update_prices():
+    async with aiohttp.ClientSession() as session:
+        btc_price, btc_vol = await get_price_and_volume(session, "bitcoin")
+        eth_price, eth_vol = await get_price_and_volume(session, "ethereum")
 
-# ===== Запуск бота =====
-@bot.event
-async def on_ready():
-    logger.info(f"✅ Bot started as {bot.user}")
-    # Запуск твоих тасков обновления здесь
-    # Например:
-    # update_prices.start()
-    # update_fng.start()
-    # update_sessions.start()
-    # health_ping.start()
-    update_sessions.start()
+        if btc_price is not None:
+            await update_channel_if_changed(BTC_PRICE_CHANNEL_ID, f"BTC: ${btc_price:,.2f}", "btc_price")
+        if eth_price is not None:
+            await update_channel_if_changed(ETH_PRICE_CHANNEL_ID, f"ETH: ${eth_price:,.2f}", "eth_price")
 
-if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN not set")
-        exit(1)
-    bot.run(DISCORD_TOKEN)
+        if btc_vol is not None:
+            await update_channel_if_changed(BTC_VOL_CHANNEL_ID, f"BTC Vol: {format_volume(btc_vol)}", "btc_vol")
+        if eth_vol is not None:
+            await update_channel_if_changed(ETH_VOL_CHANNEL_ID, f"ETH Vol: {format_volume(eth_vol)}", "eth_vol")
 
-# ===== Таск update_sessions =====
-from discord.ext import tasks
+@tasks.loop(minutes=43)
+async def update_fng():
+    async with aiohttp.ClientSession() as session:
+        fng = await get_fear_and_greed(session)
+        if fng is not None:
+            await update_channel_if_changed(FNG_CHANNEL_ID, f"Fear & Greed: {fng}", "fng")
 
 @tasks.loop(minutes=17)
 async def update_sessions():
@@ -292,3 +308,32 @@ async def update_sessions():
         await update_sessions_message()
     except Exception as e:
         logger.error(f"Error in update_sessions task: {e}")
+
+@tasks.loop(minutes=30)
+async def health_ping():
+    if not HEALTH_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(HEALTH_URL) as resp:
+                if resp.status == 200:
+                    logger.info("✅ HEALTH URL pinged")
+                else:
+                    logger.warning(f"Health ping returned status {resp.status}")
+    except Exception as e:
+        logger.error(f"Health ping failed: {e}")
+
+# ===== Startup =====
+@bot.event
+async def on_ready():
+    logger.info(f"✅ Bot started as {bot.user}")
+    update_prices.start()
+    update_fng.start()
+    update_sessions.start()
+    health_ping.start()
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        logger.error("DISCORD_TOKEN not set")
+        exit(1)
+    bot.run(DISCORD_TOKEN)
