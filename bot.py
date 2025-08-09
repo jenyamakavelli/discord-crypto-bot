@@ -241,20 +241,29 @@ async def update_sessions_message():
         logger.warning("Sessions channel not found")
         return
 
-    # Получаем pinned messages, ищем наше
     pinned = await channel.pins()
     pinned_msg = pinned[0] if pinned else None
 
     now = datetime.utcnow().replace(second=0, microsecond=0)
     sessions = get_forex_sessions_utc(now)
 
+    # Время последнего обновления для заголовка
+    # last_update — храним либо как глобальную переменную, либо просто сейчас
+    # Для демонстрации используем now (текущий момент)
+    # Для динамичного "обновлено N мин назад" нужно сохранять время последнего обновления в переменную
+    # Допустим last_update_dt = now (т.к. обновляем каждую минуту)
+    last_update_dt = now
+
+    updated_text = format_updated_since(last_update_dt, now)
+
     lines = [
-        f"🕒 Market sessions (relative times, UTC) — updated {now.strftime('%Y-%m-%d %H:%M')} UTC",
+        f"🕒 Market sessions (relative times, UTC) — {updated_text}",
         ""
     ]
 
     for session_name, info in sessions.items():
-        lines.append(f"{session_name}: {info['status']} — {info['relative']}")
+        emoji = get_session_status_emoji(info['status'], info['relative'])
+        lines.append(f"{emoji} {session_name}: {info['status']} — {info['relative']}")
 
     lines.append("")
     lines.append("⚠️ Countdown is relative (D days Hh Mm). Gap alerts posted for session opens.")
