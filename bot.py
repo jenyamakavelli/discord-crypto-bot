@@ -45,7 +45,7 @@ async def fetch_price(coin_id):
             data = await resp.json()
             return float(data[coin_id]["usd"])
 
-@tasks.loop(minutes=3)
+@tasks.loop(minutes=5)
 async def update_prices():
     logger.info("🔄 Начинаю обновление цен")
     try:
