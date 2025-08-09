@@ -7,7 +7,6 @@ import requests
 from flask import Flask
 from threading import Thread
 
-# Настройка логгера
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -15,7 +14,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 FNG_CHANNEL_ID = int(os.getenv("FNG_CHANNEL_ID"))
-VOLUME_CHANNEL_ID = int(os.getenv("VOLUME_CHANNEL_ID"))
+BTC_VOLUME_CHANNEL_ID = int(os.getenv("BTC_VOLUME_CHANNEL_ID"))
+ETH_VOLUME_CHANNEL_ID = int(os.getenv("ETH_VOLUME_CHANNEL_ID"))
 HEALTH_URL = os.getenv("HEALTH_URL", "http://localhost:8000/health")
 
 intents = discord.Intents.default()
@@ -125,25 +125,31 @@ async def update_fng():
 
 @tasks.loop(minutes=3)
 async def update_volume():
-    logger.info("🔄 Обновляю объёмы торгов...")
+    logger.info("🔄 Обновляю объёмы торгов отдельно...")
     data = get_coingecko_price_volume(["bitcoin", "ethereum"])
     if not data:
         return
     btc_vol = data.get("bitcoin", {}).get("usd_24h_vol")
     eth_vol = data.get("ethereum", {}).get("usd_24h_vol")
-    vol_channel = client.get_channel(VOLUME_CHANNEL_ID)
-    if vol_channel:
-        parts = []
-        if btc_vol is not None:
-            parts.append(f"BTC Vol: ${format_volume(btc_vol)}")
-        if eth_vol is not None:
-            parts.append(f"ETH Vol: ${format_volume(eth_vol)}")
-        vol_name = " | ".join(parts)
+
+    btc_vol_channel = client.get_channel(BTC_VOLUME_CHANNEL_ID)
+    eth_vol_channel = client.get_channel(ETH_VOLUME_CHANNEL_ID)
+
+    if btc_vol_channel and btc_vol is not None:
         try:
-            await vol_channel.edit(name=vol_name)
-            logger.info(f"Обновлено имя канала объёмов: {vol_name}")
+            vol_str = format_volume(btc_vol)
+            await btc_vol_channel.edit(name=f"BTC Vol: ${vol_str}")
+            logger.info(f"Обновлено имя канала объёмов BTC: ${vol_str}")
         except discord.HTTPException as e:
-            logger.warning(f"Ошибка обновления канала объёмов: {e}")
+            logger.warning(f"Ошибка обновления канала объёмов BTC: {e}")
+
+    if eth_vol_channel and eth_vol is not None:
+        try:
+            vol_str = format_volume(eth_vol)
+            await eth_vol_channel.edit(name=f"ETH Vol: ${vol_str}")
+            logger.info(f"Обновлено имя канала объёмов ETH: ${vol_str}")
+        except discord.HTTPException as e:
+            logger.warning(f"Ошибка обновления канала объёмов ETH: {e}")
 
 if __name__ == "__main__":
     Thread(target=run_flask).start()
