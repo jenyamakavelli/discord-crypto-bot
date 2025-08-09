@@ -19,7 +19,7 @@ async def get_prices():
             data = await resp.json()
             return data["bitcoin"]["usd"], data["ethereum"]["usd"]
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=5)
 async def update_prices():
     try:
         btc_price, eth_price = await get_prices()
