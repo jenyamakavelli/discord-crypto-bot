@@ -1,13 +1,13 @@
+import os
 import discord
 from discord.ext import tasks
 import aiohttp
-import asyncio
 import logging
 
-# --- Настройки ---
-DISCORD_TOKEN = "DISCORD_TOKEN"
-BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
-ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
+# --- Настройки из переменных окружения ---
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # Токен бота в .env или настройках Koyeb
+BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))  # ID голосового канала BTC
+ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))  # ID голосового канала ETH
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
