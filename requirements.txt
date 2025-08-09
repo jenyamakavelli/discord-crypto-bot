@@ -1,8 +1,9 @@
-discord.py
+discord.py>=2.5.0
 aiohttp
 yfinance
 feedparser
 pandas
+python-dotenv
 aiosqlite
 flask
 requests
