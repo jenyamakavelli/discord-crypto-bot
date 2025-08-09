@@ -6,7 +6,19 @@ import discord
 from discord.ext import tasks, commands
 from flask import Flask
 from threading import Thread
-from datetime import datetime, timedelta
+from datetime import datetime
+
+def format_updated_since(last_update_dt, now_dt=None):
+    if now_dt is None:
+        now_dt = datetime.utcnow()
+    diff = now_dt - last_update_dt
+    seconds = int(diff.total_seconds())
+    if seconds < 60:
+        return "обновлено только что"
+    minutes = seconds // 60
+    if minutes == 1:
+        return "обновлено 1 мин назад"
+    return f"обновлено {minutes} мин назад"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
