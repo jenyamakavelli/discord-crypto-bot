@@ -5,7 +5,7 @@ import asyncio
 import logging
 
 # --- Настройки ---
-DISCORD_TOKEN = "твой_токен_бота"
+DISCORD_TOKEN = "DISCORD_TOKEN"
 BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 
