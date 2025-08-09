@@ -1,158 +1,150 @@
 import os
 import asyncio
 import logging
-import threading
 from discord.ext import commands, tasks
-from flask import Flask, jsonify
+import discord
 import requests
+from flask import Flask
+from threading import Thread
 
+# Настройка логгера
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
-# Конфиги из окружения — обязательно задавай в настройках Koyeb
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
 BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
-FNG_CHANNEL_ID = int(os.getenv("FNG_CHANNEL_ID"))  # канал для Fear&Greed индекса
-COINGECKO_VOLUME_CHANNEL_ID = int(os.getenv("COINGECKO_VOLUME_CHANNEL_ID"))
+FNG_CHANNEL_ID = int(os.getenv("FNG_CHANNEL_ID"))
+VOLUME_CHANNEL_ID = int(os.getenv("VOLUME_CHANNEL_ID"))
+HEALTH_URL = os.getenv("HEALTH_URL", "http://localhost:8000/health")
 
-# Flask Health-check сервер
-app = Flask(__name__)
+intents = discord.Intents.default()
+client = commands.Bot(command_prefix="!", intents=intents)
+
+app = Flask("bot")
 
 @app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
+def health_check():
+    return "OK", 200
 
 def run_flask():
     app.run(host="0.0.0.0", port=8000)
 
-threading.Thread(target=run_flask, daemon=True).start()
+def format_volume(vol: float) -> str:
+    abs_vol = abs(vol)
+    if abs_vol >= 1_000_000_000_000:
+        return f"{vol / 1_000_000_000_000:.1f}T"
+    elif abs_vol >= 1_000_000_000:
+        return f"{vol / 1_000_000_000:.1f}B"
+    elif abs_vol >= 1_000_000:
+        return f"{vol / 1_000_000:.1f}M"
+    elif abs_vol >= 1_000:
+        return f"{vol / 1_000:.1f}K"
+    else:
+        return f"{vol:.0f}"
 
-intents = commands.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Последние сохранённые значения, чтобы не спамить обновления
-last_prices = {"btc": None, "eth": None}
-last_fng = None
-last_volume = None
-
-# Интервалы обновления в минутах
-UPDATE_INTERVAL_PRICES = 3
-UPDATE_INTERVAL_FNG = 15
-UPDATE_INTERVAL_VOLUME = 10
-
-
-def get_prices():
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": "bitcoin,ethereum",
-        "vs_currencies": "usd",
-        "include_24hr_vol": "true"
-    }
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return {
-        "btc": data["bitcoin"]["usd"],
-        "eth": data["ethereum"]["usd"],
-        "btc_vol": data["bitcoin"].get("usd_24h_vol"),
-        "eth_vol": data["ethereum"].get("usd_24h_vol"),
-    }
-
-
-def get_fng_index():
-    url = "https://api.alternative.me/fng/"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return int(data["data"][0]["value"])
-
-
-def get_coingecko_volume():
-    # Собираем суммарный 24ч объём BTC+ETH с CoinGecko
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": "bitcoin,ethereum",
-        "vs_currencies": "usd",
-        "include_24hr_vol": "true"
-    }
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    btc_vol = data["bitcoin"].get("usd_24h_vol", 0)
-    eth_vol = data["ethereum"].get("usd_24h_vol", 0)
-    total_vol = btc_vol + eth_vol
-    return total_vol
-
-
-async def update_prices_task():
-    global last_prices
-    while True:
-        try:
-            logger.info("🔄 Обновляю цены BTC и ETH...")
-            prices = get_prices()
-            btc_price = prices["btc"]
-            eth_price = prices["eth"]
-
-            channel_btc = await bot.fetch_channel(BTC_CHANNEL_ID)
-            channel_eth = await bot.fetch_channel(ETH_CHANNEL_ID)
-
-            # Обновляем, только если цена изменилась (можно убрать проверку, если хочешь всегда обновлять)
-            if last_prices["btc"] != btc_price:
-                await channel_btc.edit(name=f"BTC: ${btc_price:,.0f}")
-                logger.info(f"Обновлено имя канала {BTC_CHANNEL_ID}: BTC: ${btc_price:,.0f}")
-                last_prices["btc"] = btc_price
-            if last_prices["eth"] != eth_price:
-                await channel_eth.edit(name=f"ETH: ${eth_price:,.2f}")
-                logger.info(f"Обновлено имя канала {ETH_CHANNEL_ID}: ETH: ${eth_price:,.2f}")
-                last_prices["eth"] = eth_price
-
-        except Exception as e:
-            logger.warning(f"Ошибка обновления цен: {e}")
-        await asyncio.sleep(UPDATE_INTERVAL_PRICES * 60)
-
-
-async def update_fng_task():
-    global last_fng
-    while True:
-        try:
-            logger.info("🔄 Обновляю индекс страха и жадности...")
-            fng = get_fng_index()
-            channel = await bot.fetch_channel(FNG_CHANNEL_ID)
-            if last_fng != fng:
-                await channel.edit(name=f"Fear & Greed: {fng}")
-                logger.info(f"Обновлено имя канала {FNG_CHANNEL_ID}: Fear & Greed: {fng}")
-                last_fng = fng
-        except Exception as e:
-            logger.warning(f"Ошибка обновления FNG: {e}")
-        await asyncio.sleep(UPDATE_INTERVAL_FNG * 60)
-
-
-async def update_volume_task():
-    global last_volume
-    while True:
-        try:
-            logger.info("🔄 Обновляю объёмы торгов CoinGecko...")
-            volume = get_coingecko_volume()
-            channel = await bot.fetch_channel(COINGECKO_VOLUME_CHANNEL_ID)
-            if last_volume != volume:
-                vol_str = f"{volume/1_000_000_000:.2f}B $24h vol"
-                await channel.edit(name=f"Volume CG: {vol_str}")
-                logger.info(f"Обновлено имя канала {COINGECKO_VOLUME_CHANNEL_ID}: Volume CG: {vol_str}")
-                last_volume = volume
-        except Exception as e:
-            logger.warning(f"Ошибка обновления объёмов: {e}")
-        await asyncio.sleep(UPDATE_INTERVAL_VOLUME * 60)
-
-
-@bot.event
+@client.event
 async def on_ready():
-    logger.info(f"✅ Бот запущен как {bot.user}")
-    # Запускаем задачи обновления параллельно
-    bot.loop.create_task(update_prices_task())
-    bot.loop.create_task(update_fng_task())
-    bot.loop.create_task(update_volume_task())
+    logger.info(f"✅ Бот запущен как {client.user}")
+    update_prices.start()
+    update_fng.start()
+    update_volume.start()
 
+def get_coingecko_price_volume(ids: list):
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": ",".join(ids),
+        "vs_currencies": "usd",
+        "include_24hr_vol": "true",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning(f"Ошибка запроса CoinGecko price/volume: {e}")
+        return None
+
+def get_fear_greed_index():
+    url = "https://api.alternative.me/fng/"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if "data" in data and len(data["data"]) > 0:
+            value = data["data"][0].get("value")
+            return int(value)
+        else:
+            logger.warning("FNG data format unexpected")
+            return None
+    except Exception as e:
+        logger.warning(f"Ошибка запроса Fear & Greed Index: {e}")
+        return None
+
+@tasks.loop(minutes=3)
+async def update_prices():
+    logger.info("🔄 Обновляю цены BTC и ETH...")
+    data = get_coingecko_price_volume(["bitcoin", "ethereum"])
+    if not data:
+        return
+
+    btc_price = data.get("bitcoin", {}).get("usd")
+    eth_price = data.get("ethereum", {}).get("usd")
+    if btc_price is None or eth_price is None:
+        logger.warning("Нет данных по ценам BTC или ETH")
+        return
+
+    btc_channel = client.get_channel(BTC_CHANNEL_ID)
+    eth_channel = client.get_channel(ETH_CHANNEL_ID)
+    if btc_channel:
+        try:
+            await btc_channel.edit(name=f"BTC: ${btc_price:,.0f}")
+            logger.info(f"Обновлено имя канала BTC: ${btc_price:,.0f}")
+        except discord.HTTPException as e:
+            logger.warning(f"Ошибка обновления канала BTC: {e}")
+    if eth_channel:
+        try:
+            await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
+            logger.info(f"Обновлено имя канала ETH: ${eth_price:,.2f}")
+        except discord.HTTPException as e:
+            logger.warning(f"Ошибка обновления канала ETH: {e}")
+
+@tasks.loop(minutes=15)
+async def update_fng():
+    logger.info("🔄 Обновляю индекс страха и жадности...")
+    fng_value = get_fear_greed_index()
+    if fng_value is None:
+        return
+    fng_channel = client.get_channel(FNG_CHANNEL_ID)
+    if fng_channel:
+        try:
+            await fng_channel.edit(name=f"Fear & Greed: {fng_value}")
+            logger.info(f"Обновлено имя канала Fear & Greed: {fng_value}")
+        except discord.HTTPException as e:
+            logger.warning(f"Ошибка обновления канала Fear & Greed: {e}")
+
+@tasks.loop(minutes=3)
+async def update_volume():
+    logger.info("🔄 Обновляю объёмы торгов...")
+    data = get_coingecko_price_volume(["bitcoin", "ethereum"])
+    if not data:
+        return
+    btc_vol = data.get("bitcoin", {}).get("usd_24h_vol")
+    eth_vol = data.get("ethereum", {}).get("usd_24h_vol")
+    vol_channel = client.get_channel(VOLUME_CHANNEL_ID)
+    if vol_channel:
+        parts = []
+        if btc_vol is not None:
+            parts.append(f"BTC Vol: ${format_volume(btc_vol)}")
+        if eth_vol is not None:
+            parts.append(f"ETH Vol: ${format_volume(eth_vol)}")
+        vol_name = " | ".join(parts)
+        try:
+            await vol_channel.edit(name=vol_name)
+            logger.info(f"Обновлено имя канала объёмов: {vol_name}")
+        except discord.HTTPException as e:
+            logger.warning(f"Ошибка обновления канала объёмов: {e}")
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    Thread(target=run_flask).start()
+    client.run(TOKEN)
