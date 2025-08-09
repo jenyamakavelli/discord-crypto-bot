@@ -6,7 +6,7 @@ import discord
 from discord.ext import tasks, commands
 from flask import Flask
 from threading import Thread
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, timedelta, timezone
 import pytz
 
 logging.basicConfig(level=logging.INFO)
@@ -121,52 +121,38 @@ async def update_channel_if_changed(channel_id, new_name, key):
 
 MIAMI_TZ = pytz.timezone("America/New_York")
 
-def get_next_weekday(base_date, target_weekday):
-    """Возвращает дату ближайшего target_weekday (0=Пн) >= base_date"""
-    days_ahead = (target_weekday - base_date.weekday()) % 7
-    return base_date + timedelta(days=days_ahead)
+def get_friday_17(now_miami):
+    friday = now_miami.replace(hour=17, minute=0, second=0, microsecond=0)
+    days_to_friday = (4 - now_miami.weekday()) % 7
+    friday = friday + timedelta(days=days_to_friday)
+    if now_miami >= friday:
+        friday += timedelta(days=7)
+    return friday
+
+def get_sunday_17(now_miami):
+    sunday = now_miami.replace(hour=17, minute=0, second=0, microsecond=0)
+    days_to_sunday = (6 - now_miami.weekday()) % 7
+    sunday = sunday + timedelta(days=days_to_sunday)
+    if now_miami >= sunday:
+        sunday += timedelta(days=7)
+    return sunday
 
 def get_market_status(market_name, now_miami):
-    """
-    Рассчитывает статус рынка (open/closed/soon) и время до закрытия или открытия.
-    Учёт выходных:
-    - Рынки закрыты с пятницы 17:00 по Майами до воскресенья 17:00 по Майами.
-    - Открываются в воскресенье 17:00.
-    - Закрываются в пятницу 17:00.
-    """
+    # Все рынки закрыты с пятницы 17:00 по Майами до воскресенья 17:00 по Майами
+    this_friday_17 = get_friday_17(now_miami)
+    this_sunday_17 = get_sunday_17(now_miami)
 
-    # Выходные границы
-    this_friday_17 = get_next_weekday(now_miami, 4).replace(hour=17, minute=0, second=0, microsecond=0)
-    this_sunday_17 = get_next_weekday(now_miami, 6).replace(hour=17, minute=0, second=0, microsecond=0)
-
-    # Если сейчас после воскресенья 17:00, обновляем пятницу и воскресенье на следующую неделю
-    if now_miami >= this_sunday_17:
-        this_friday_17 = this_friday_17 + timedelta(days=7)
-        this_sunday_17 = this_sunday_17 + timedelta(days=7)
-
-    # Проверяем, в выходные ли сейчас
     if this_friday_17 <= now_miami < this_sunday_17:
-        # Рынки закрыты
         status = "closed"
         time_to_open = this_sunday_17 - now_miami
-        # Если время до открытия < 1 час, статус soon
-        if time_to_open.total_seconds() <= 3600:
-            status = "soon"
         return status, time_to_open
 
-    # Иначе рынки открыты
-    status = "open"
-    # Если сейчас пятница после 17:00 (то есть ещё не зашли в выходные), то время до закрытия след. пятницы
+    # Иначе рынок открыт — закрывается в пятницу 17:00
     if now_miami >= this_friday_17:
-        next_friday_17 = this_friday_17 + timedelta(days=7)
-    else:
-        next_friday_17 = this_friday_17
-    time_to_close = next_friday_17 - now_miami
+        this_friday_17 += timedelta(days=7)
 
-    # Аналогично, если время до закрытия < 1 час, статус soon (на закрытие)
-    if time_to_close.total_seconds() <= 3600:
-        status = "soon"
-
+    status = "open"
+    time_to_close = this_friday_17 - now_miami
     return status, time_to_close
 
 def format_timedelta(delta):
@@ -182,17 +168,18 @@ def format_timedelta(delta):
     parts.append(f"{minutes}m")
     return " ".join(parts)
 
-def get_session_status_emoji(status):
+def get_session_status_emoji(status, relative_seconds):
     if status == "open":
         return "🟢"
-    elif status == "soon":
-        return "🟡"
     elif status == "closed":
+        if relative_seconds <= 3600:
+            return "🟡"
         return "🔴"
-    else:
-        return ""
+    return ""
 
 def format_updated_since(last_update_dt, now_dt):
+    if last_update_dt is None:
+        return "обновлено только что"
     diff = now_dt - last_update_dt
     seconds = diff.total_seconds()
     if seconds < 60:
@@ -208,6 +195,11 @@ async def update_sessions_message():
     now_utc = datetime.now(timezone.utc)
     now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
 
+    last_update = last_values.get("sessions_last_update")
+    if last_update is None:
+        last_update = now_utc
+        last_values["sessions_last_update"] = now_utc
+
     markets = ["Tokyo", "London", "New York"]
     sessions_info = {}
 
@@ -219,16 +211,14 @@ async def update_sessions_message():
             "formatted_delta": format_timedelta(delta),
         }
 
-    last_update = last_values.get("sessions_last_update", now_utc)
     updated_text = format_updated_since(last_update, now_utc)
-
     header = f"🕒 Market sessions (relative times, UTC) — {updated_text}\n\n"
 
     lines = []
     for market in markets:
         info = sessions_info[market]
-        emoji = get_session_status_emoji(info["status"])
-        status_text = "open — closes in" if info["status"] == "open" or info["status"] == "soon" else "closed — opens in"
+        emoji = get_session_status_emoji(info["status"], info["relative"])
+        status_text = "open — closes in" if info["status"] == "open" else "closed — opens in"
         line = f"{emoji} {market}: {status_text} {info['formatted_delta']}"
         lines.append(line)
 
