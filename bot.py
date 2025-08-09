@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import aiohttp
+import discord
 from discord.ext import commands, tasks
 from aiohttp import web
 
@@ -20,12 +21,12 @@ ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 PORT = int(os.getenv("PORT", 8000))  # Для health-check
 
 # ------------------ DISCORD ------------------
-intents = commands.Intents.default()
+intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------ ПОЛУЧЕНИЕ ЦЕН ------------------
 async def fetch_price(session, coin_id):
-    url = f"https://api.coingecko.com/api/v3/simple/price"
+    url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coin_id, "vs_currencies": "usd"}
     async with session.get(url, params=params) as resp:
         data = await resp.json()
@@ -77,7 +78,7 @@ async def start_webserver():
 
 # ------------------ ЗАПУСК ------------------
 async def main():
-    await start_webserver()  # Запускаем health-check
+    await start_webserver()
     await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
