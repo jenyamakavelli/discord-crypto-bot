@@ -6,22 +6,10 @@ import discord
 from discord.ext import tasks, commands
 from flask import Flask
 from threading import Thread
-from datetime import datetime
-
-def format_updated_since(last_update_dt, now_dt=None):
-    if now_dt is None:
-        now_dt = datetime.utcnow()
-    diff = now_dt - last_update_dt
-    seconds = int(diff.total_seconds())
-    if seconds < 60:
-        return "обновлено только что"
-    minutes = seconds // 60
-    if minutes == 1:
-        return "обновлено 1 мин назад"
-    return f"обновлено {minutes} мин назад"
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
+logger = logging.getLogger(__name__)
 
 # =============== CONFIG ===============
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -30,7 +18,7 @@ ETH_PRICE_CHANNEL_ID = int(os.getenv("ETH_PRICE_CHANNEL_ID"))
 FNG_CHANNEL_ID = int(os.getenv("FNG_CHANNEL_ID"))
 BTC_VOL_CHANNEL_ID = int(os.getenv("BTC_VOL_CHANNEL_ID"))
 ETH_VOL_CHANNEL_ID = int(os.getenv("ETH_VOL_CHANNEL_ID"))
-SESSIONS_CHANNEL_ID = int(os.getenv("SESSIONS_CHANNEL_ID"))  # канал для pinned message с сессиями
+SESSIONS_CHANNEL_ID = int(os.getenv("SESSIONS_CHANNEL_ID"))  # Канал для сообщений с сессиями
 HEALTH_URL = os.getenv("HEALTH_URL")  # Для Koyeb Ping
 # =====================================
 
@@ -56,9 +44,11 @@ last_values = {
     "btc_vol": None,
     "eth_vol": None,
     "fng": None,
+    "sessions_msg_id": None,
+    "sessions_last_update": None,
 }
 
-# ===== Async HTTP fetch with retry & backoff =====
+# ===== Async fetch with retry =====
 async def fetch_json(session, url, max_retries=5):
     backoff = 1
     for attempt in range(max_retries):
@@ -66,7 +56,7 @@ async def fetch_json(session, url, max_retries=5):
             async with session.get(url, timeout=10) as resp:
                 if resp.status == 429:
                     retry_after = int(resp.headers.get("Retry-After", backoff))
-                    logger.warning(f"429 rate limited by API, sleeping {retry_after} sec")
+                    logger.warning(f"429 rate limited, sleeping {retry_after} sec")
                     await asyncio.sleep(retry_after)
                     backoff = min(backoff * 2, 60)
                     continue
@@ -104,7 +94,7 @@ async def get_fear_and_greed(session):
         logger.warning("Malformed Fear & Greed Index data")
         return None
 
-# ===== Helper to format volume =====
+# ===== Helpers =====
 def format_volume(vol):
     if vol >= 1_000_000_000:
         return f"${vol/1_000_000_000:.1f}B"
@@ -113,7 +103,146 @@ def format_volume(vol):
     else:
         return f"${vol:,.0f}"
 
-# ===== Update channel only if value changed =====
+def format_updated_since(last_update_dt, now_dt=None):
+    if now_dt is None:
+        now_dt = datetime.utcnow()
+    diff = now_dt - last_update_dt
+    seconds = int(diff.total_seconds())
+    if seconds < 60:
+        return "обновлено только что"
+    minutes = seconds // 60
+    if minutes == 1:
+        return "обновлено 1 мин назад"
+    return f"обновлено {minutes} мин назад"
+
+def get_session_status_emoji(status, relative_seconds):
+    # status: 'open' or 'closed'
+    # relative_seconds: время в секундах до открытия (если closed) или до закрытия (если open)
+    # Если сессия открыта — 🟢
+    # Если закрыта и время до открытия менее 1 часа — 🟡
+    # Иначе 🔴
+    if status == 'open':
+        return "🟢"
+    elif status == 'closed':
+        if 0 < relative_seconds <= 3600:
+            return "🟡"
+        else:
+            return "🔴"
+    else:
+        return ""
+
+def format_relative_time(delta: timedelta):
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+# ===== Market sessions info =====
+# UTC время открытия и закрытия
+MARKET_SESSIONS = {
+    "Tokyo": {"open": 0, "close": 9*3600},      # 00:00-09:00 UTC
+    "London": {"open": 8*3600, "close": 17*3600},  # 08:00-17:00 UTC
+    "New York": {"open": 13*3600, "close": 22*3600}, # 13:00-22:00 UTC
+}
+
+def get_next_weekday(dt, weekday):
+    # weekday: 0=Monday, 6=Sunday
+    days_ahead = weekday - dt.weekday()
+    if days_ahead <= 0:
+        days_ahead += 7
+    return dt + timedelta(days=days_ahead)
+
+def get_session_status(now_utc, session_name):
+    session = MARKET_SESSIONS[session_name]
+    open_ts = session["open"]
+    close_ts = session["close"]
+    now_seconds = now_utc.hour*3600 + now_utc.minute*60 + now_utc.second
+
+    # Выходные: сессии не работают в субботу и воскресенье, считаем все закрытыми
+    if now_utc.weekday() in (5,6):  # Sat=5, Sun=6
+        # На выходных считаем ближайшее открытие следующим понедельником
+        next_open_dt = datetime(now_utc.year, now_utc.month, now_utc.day) + timedelta(days=(7 - now_utc.weekday()))
+        next_open_dt = next_open_dt.replace(hour=open_ts // 3600, minute=(open_ts % 3600)//60, second=0, microsecond=0)
+        delta_to_open = next_open_dt - now_utc
+        return {
+            "status": "closed",
+            "relative": delta_to_open,
+            "relative_seconds": int(delta_to_open.total_seconds())
+        }
+
+    if open_ts <= now_seconds < close_ts:
+        # Сессия открыта
+        delta_to_close = timedelta(seconds=close_ts - now_seconds)
+        return {
+            "status": "open",
+            "relative": delta_to_close,
+            "relative_seconds": close_ts - now_seconds
+        }
+    else:
+        # Сессия закрыта
+        # Определим время открытия — сегодня или завтра
+        if now_seconds < open_ts:
+            next_open_dt = datetime(now_utc.year, now_utc.month, now_utc.day) + timedelta(seconds=open_ts - now_seconds)
+        else:
+            # После закрытия, открывается завтра
+            next_day = now_utc + timedelta(days=1)
+            next_open_dt = datetime(next_day.year, next_day.month, next_day.day) + timedelta(seconds=open_ts)
+        delta_to_open = next_open_dt - now_utc
+        return {
+            "status": "closed",
+            "relative": delta_to_open,
+            "relative_seconds": int(delta_to_open.total_seconds())
+        }
+
+async def update_sessions_message():
+    channel = bot.get_channel(SESSIONS_CHANNEL_ID)
+    if not channel:
+        logger.warning("Канал для сессий не найден")
+        return
+
+    now = datetime.utcnow().replace(second=0, microsecond=0)
+    last_update = last_values.get("sessions_last_update")
+    last_values["sessions_last_update"] = now
+
+    # Формат времени обновления
+    updated_text = format_updated_since(last_update, now) if last_update else f"обновлено {now.strftime('%Y-%m-%d %H:%M UTC')}"
+
+    lines = [f"🕒 Market sessions (relative times, UTC) — {updated_text}", ""]
+
+    for name in ["Tokyo", "London", "New York"]:
+        info = get_session_status(now, name)
+        emoji = get_session_status_emoji(info['status'], info['relative_seconds'])
+        rel_time_str = format_relative_time(info['relative'])
+        line = f"{emoji} {name}: {info['status']} — {'opens in' if info['status']=='closed' else 'closes in'} {rel_time_str}"
+        lines.append(line)
+
+    lines.append("")
+    lines.append("⚠️ Countdown is relative (D days Hh Mm). Gap alerts posted for session opens.")
+
+    msg_content = "\n".join(lines)
+
+    # Пиннинг: либо редактировать пин или последнее закреплённое сообщение в канале
+    pinned = await channel.pins()
+    msg = None
+    if pinned:
+        msg = pinned[0]
+        await msg.edit(content=msg_content)
+    else:
+        msg = await channel.send(msg_content)
+        await msg.pin()
+
+    logger.info(f"Updated sessions message in channel {SESSIONS_CHANNEL_ID}")
+
+# ===== Update channel if changed =====
 async def update_channel_if_changed(channel_id, new_name, key):
     if last_values.get(key) != new_name:
         channel = bot.get_channel(channel_id)
@@ -121,179 +250,11 @@ async def update_channel_if_changed(channel_id, new_name, key):
             try:
                 await channel.edit(name=new_name)
                 last_values[key] = new_name
-                logger.info(f"Updated channel {channel_id}: {new_name}")
+                logger.info(f"Обновлен канал {channel_id}: {new_name}")
             except discord.HTTPException as e:
-                logger.error(f"Error updating channel {channel_id}: {e}")
+                logger.error(f"Ошибка обновления канала {channel_id}: {e}")
 
-# ===== Market sessions logic =====
-def seconds_to_dhm(seconds: int):
-    days = seconds // 86400
-    seconds %= 86400
-    hours = seconds // 3600
-    seconds %= 3600
-    minutes = seconds // 60
-    parts = []
-    if days > 0:
-        parts.append(f"{days}d")
-    if hours > 0 or days > 0:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    return " ".join(parts)
-
-def get_forex_sessions_utc(now=None):
-    # Forex сессии UTC время (всегда в UTC):
-    # Tokyo: 00:00 - 09:00 UTC (00:00 понедельник - 09:00 пятница)
-    # London: 08:00 - 17:00 UTC (08:00 понедельник - 17:00 пятница)
-    # New York: 13:00 - 22:00 UTC (13:00 понедельник - 22:00 пятница)
-    # Выходные с пятницы 22:00 по воскресенье 22:00 UTC
-    # Все даты и время - UTC
-
-    if now is None:
-        now = datetime.utcnow()
-
-    # Определим базовые времена открытия и закрытия (для текущего или следующего рабочего дня)
-    weekday = now.weekday()  # 0=понедельник .. 6=воскресенье
-    time_seconds = now.hour * 3600 + now.minute * 60 + now.second
-
-    # Проверка на выходные Forex (пятница 22:00 - воскресенье 22:00)
-    friday_close_time = (4 * 86400) + (22 * 3600)  # пятница 22:00 в секундах с начала недели
-    sunday_open_time = (6 * 86400) + (22 * 3600)   # воскресенье 22:00 в секундах с начала недели
-
-    now_seconds = weekday * 86400 + time_seconds
-
-    forex_closed = friday_close_time <= now_seconds < sunday_open_time
-
-    sessions = {
-        "Tokyo": {"open": (0 * 86400) + (0 * 3600), "close": (0 * 86400) + (9 * 3600)},    # 00:00-09:00 UTC каждый день (Пон-Пят)
-        "London": {"open": (0 * 86400) + (8 * 3600), "close": (0 * 86400) + (17 * 3600)},  # 08:00-17:00 UTC
-        "New York": {"open": (0 * 86400) + (13 * 3600), "close": (0 * 86400) + (22 * 3600)}, # 13:00-22:00 UTC
-    }
-
-    # Для дней с понедельника по пятницу
-    # Расчёт открытия и закрытия с учётом дня недели и выходных
-    result = {}
-
-    def get_next_open_close(session_name):
-        # Сессии работают только с Понедельника по Пятницу,
-        # С пятницы 22:00 по воскресенье 22:00 рынок закрыт
-
-        # Текущее время в секундах с начала недели:
-        # Относительные секунды открытия и закрытия сессии для каждого дня
-
-        # Найдем ближайший открывающийся слот и закрывающийся слот для сессии
-
-        # Поскольку сессии всегда с 0 до 9, 8-17, 13-22 часов (UTC),
-        # смещаем на конкретный день для вычисления времени
-
-        # Сессии открыты Пн-Пт, то есть дни 0..4
-        # Нужно определить, открыт ли сейчас рынок и сколько осталось до открытия/закрытия
-
-        # Определим ближайший open и close в будущем относительно now
-
-        # Функция возвращает (status:str, text:str) например "open", "closes in 5h 3m" и тд
-
-        # Найдем текущее время в секундах от начала недели
-        now_week_sec = weekday * 86400 + time_seconds
-
-        # Сессия открыта, если сейчас в пределах open-close для сегодняшнего дня и сегодня пн-пт
-        today_open_sec = weekday * 86400 + sessions[session_name]["open"]
-        today_close_sec = weekday * 86400 + sessions[session_name]["close"]
-
-        # Проверим открыт ли сейчас рынок для этой сессии
-        if 0 <= weekday <= 4 and today_open_sec <= now_week_sec < today_close_sec:
-            # открыт, считаем сколько осталось до закрытия
-            secs_left = today_close_sec - now_week_sec
-            return ("open", f"closes in {seconds_to_dhm(secs_left)}")
-
-        # Если сейчас выходные
-        if forex_closed:
-            # Рынок закрыт до воскресенья 22:00 (6-й день недели 22:00)
-            # Отсчёт до открытия сессии в понедельник
-            # Понедельник — 0-й день
-            # Для открытия сессии понедельника добавляем дни до понедельника + offset открытие сессии
-            next_open_weekday = 0
-            next_open_sec = next_open_weekday * 86400 + sessions[session_name]["open"]
-
-            # Добавим неделю к now_week_sec, если next_open_sec <= now_week_sec (т.к. мы сейчас в выходные, но open раньше понедельника)
-            if next_open_sec <= now_week_sec:
-                next_open_sec += 7 * 86400
-
-            diff = next_open_sec - now_week_sec
-            return ("closed", f"opens in {seconds_to_dhm(diff)}")
-
-        # Если сейчас рабочий день, но рынок ещё не открылся или уже закрылся сегодня
-
-        # Если сейчас до открытия сегодня
-        if 0 <= weekday <= 4 and now_week_sec < today_open_sec:
-            diff = today_open_sec - now_week_sec
-            return ("closed", f"opens in {seconds_to_dhm(diff)}")
-
-        # Если сегодня уже после закрытия, нужно найти следующий рабочий день с открытием
-        # Найдем следующий рабочий день (следующий день понедельник-пятница)
-        next_day = (weekday + 1) % 7
-        days_ahead = 1
-        while next_day > 4:  # пропускаем выходные
-            next_day = (next_day + 1) % 7
-            days_ahead += 1
-
-        next_open_sec = next_day * 86400 + sessions[session_name]["open"]
-        diff = next_open_sec - now_week_sec
-        return ("closed", f"opens in {seconds_to_dhm(diff)}")
-
-    for session_name in sessions.keys():
-        status, rel_time = get_next_open_close(session_name)
-        result[session_name] = {"status": status, "relative": rel_time}
-
-    return result
-
-# ===== Update pinned message with sessions countdown =====
-async def update_sessions_message():
-    channel = bot.get_channel(SESSIONS_CHANNEL_ID)
-    if not channel:
-        logger.warning("Sessions channel not found")
-        return
-
-    pinned = await channel.pins()
-    pinned_msg = pinned[0] if pinned else None
-
-    now = datetime.utcnow().replace(second=0, microsecond=0)
-    sessions = get_forex_sessions_utc(now)
-
-    # Время последнего обновления для заголовка
-    # last_update — храним либо как глобальную переменную, либо просто сейчас
-    # Для демонстрации используем now (текущий момент)
-    # Для динамичного "обновлено N мин назад" нужно сохранять время последнего обновления в переменную
-    # Допустим last_update_dt = now (т.к. обновляем каждую минуту)
-    last_update_dt = now
-
-    updated_text = format_updated_since(last_update_dt, now)
-
-    lines = [
-        f"🕒 Market sessions (relative times, UTC) — {updated_text}",
-        ""
-    ]
-
-    for session_name, info in sessions.items():
-        emoji = get_session_status_emoji(info['status'], info['relative'])
-        lines.append(f"{emoji} {session_name}: {info['status']} — {info['relative']}")
-
-    lines.append("")
-    lines.append("⚠️ Countdown is relative (D days Hh Mm). Gap alerts posted for session opens.")
-
-    content = "\n".join(lines)
-
-    try:
-        if pinned_msg:
-            await pinned_msg.edit(content=content)
-            logger.info("Updated pinned sessions message")
-        else:
-            msg = await channel.send(content)
-            await msg.pin()
-            logger.info("Pinned new sessions message")
-    except discord.HTTPException as e:
-        logger.error(f"Failed to update/pin sessions message: {e}")
-
-# ===== Main tasks =====
+# ===== Tasks =====
 @tasks.loop(minutes=6)
 async def update_prices():
     async with aiohttp.ClientSession() as session:
@@ -321,7 +282,7 @@ async def update_fng():
         if fng_value is not None:
             await update_channel_if_changed(FNG_CHANNEL_ID, f"Fear & Greed: {fng_value}", "fng")
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=5)
 async def update_sessions():
     await update_sessions_message()
 
@@ -336,8 +297,9 @@ async def ping_health():
                     else:
                         logger.warning(f"⚠️ HEALTH ping returned status {resp.status}")
         except Exception as e:
-            logger.warning(f"⚠️ HEALTH ping error: {e}")
+            logger.warning(f"⚠️ Ошибка пинга HEALTH URL: {e}")
 
+# ===== Bot event =====
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot started as {bot.user}")
@@ -347,4 +309,5 @@ async def on_ready():
     update_sessions.start()
     ping_health.start()
 
+# ===== Run bot =====
 bot.run(DISCORD_TOKEN)
