@@ -38,7 +38,7 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# ===== Shared state for last values to avoid redundant updates =====
+# ===== Shared state =====
 last_values = {
     "btc_price": None,
     "eth_price": None,
@@ -50,7 +50,7 @@ last_values = {
     "sessions_last_update": None,
 }
 
-# ===== Async HTTP fetch with retry and backoff for rate limits =====
+# ===== HTTP fetch with retry =====
 async def fetch_json(session, url, max_retries=5):
     backoff = 1
     for attempt in range(max_retries):
@@ -96,7 +96,7 @@ async def get_fear_and_greed(session):
         logger.warning("Malformed Fear & Greed Index data")
         return None
 
-# ===== Helper to format volume =====
+# ===== Helpers =====
 def format_volume(vol):
     if vol >= 1_000_000_000:
         return f"${vol/1_000_000_000:.1f}B"
@@ -105,7 +105,6 @@ def format_volume(vol):
     else:
         return f"${vol:,.0f}"
 
-# ===== Update channel only if value changed =====
 async def update_channel_if_changed(channel_id, new_name, key):
     if last_values.get(key) != new_name:
         channel = bot.get_channel(channel_id)
@@ -117,22 +116,54 @@ async def update_channel_if_changed(channel_id, new_name, key):
             except discord.HTTPException as e:
                 logger.error(f"Ошибка обновления канала {channel_id}: {e}")
 
-# ===== Timezone =====
+# ===== Time zone and sessions =====
 MIAMI_TZ = pytz.timezone("America/New_York")
 
-# ===== Sessions logic =====
-def get_next_open_datetime(now, weekday_target, hour, minute=0):
-    """
-    now — datetime по Майами
-    weekday_target — 0 (понедельник) ... 6 (воскресенье)
-    hour, minute — время открытия
-    Возвращает ближайшую дату и время следующего открытия сессии.
-    """
-    days_ahead = (weekday_target - now.weekday()) % 7
-    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=days_ahead)
-    if candidate <= now:
-        candidate += timedelta(days=7)
-    return candidate
+SESSIONS = {
+    "Tokyo": {"open_hour": 17, "open_weekday": 6},   # Вс 17:00
+    "London": {"open_hour": 3, "open_weekday": 0},   # Пн 03:00
+    "New York": {"open_hour": 8, "open_weekday": 0}, # Пн 08:00
+}
+
+def get_next_session_open(now, market):
+    open_weekday = SESSIONS[market]["open_weekday"]
+    open_hour = SESSIONS[market]["open_hour"]
+
+    days_ahead = (open_weekday - now.weekday()) % 7
+    open_time = now.replace(hour=open_hour, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    if open_time <= now:
+        open_time += timedelta(days=7)
+    return open_time
+
+def get_next_session_close(open_time):
+    return open_time + timedelta(hours=24)
+
+def get_sessions_status(now_utc):
+    now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
+
+    result = {}
+    for market in SESSIONS:
+        next_open = get_next_session_open(now_miami, market)
+        next_close = get_next_session_close(next_open)
+
+        if next_open <= now_miami < next_close:
+            status = "open"
+            delta = next_close - now_miami
+        else:
+            status = "closed"
+            if now_miami >= next_close:
+                next_open += timedelta(days=7)
+            delta = next_open - now_miami
+
+        relative_seconds = int(delta.total_seconds())
+        formatted_delta = format_timedelta(delta)
+
+        result[market] = {
+            "status": status,
+            "relative_seconds": relative_seconds,
+            "formatted_delta": formatted_delta,
+        }
+    return result
 
 def format_timedelta(delta):
     total_seconds = int(delta.total_seconds())
@@ -142,66 +173,10 @@ def format_timedelta(delta):
     parts = []
     if days > 0:
         parts.append(f"{days}d")
-    parts.append(f"{hours}h")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
     parts.append(f"{minutes}m")
     return " ".join(parts)
-
-def get_sessions_status(now_utc):
-    now_miami = now_utc.astimezone(MIAMI_TZ)
-
-    # Сессии открытия: (weekday, hour)
-    sessions = {
-        "Tokyo": (6, 17),       # Воскресенье, 17:00
-        "London": (0, 3),       # Понедельник, 03:00
-        "New York": (0, 8),     # Понедельник, 08:00
-    }
-
-    result = {}
-    for name, (wd, hr) in sessions.items():
-        next_open = get_next_open_datetime(now_miami, wd, hr)
-        delta = next_open - now_miami
-
-        # Определяем статус:
-        # Если сейчас между открытием и закрытием - считаем "open"
-        # Предполагаем, что сессии открыты 24 часа до следующего открытия (простое приближение),
-        # Можно расширить логику, если нужно точнее закрытие
-
-        # Для точного закрытия можно задать время закрытия, например:
-        # Tokyo: закрывается в пятницу 17:00 Майами
-        # London: закрывается в пятницу 17:00 Майами
-        # New York: закрывается в пятницу 17:00 Майами
-        # Для простоты считаем, что сессия открыта с открытия до пятницы 17:00,
-        # если сейчас после пятницы 17:00 — закрыта.
-
-        # Рассчитаем ближайшее пятничное 17:00
-        days_until_friday = (4 - now_miami.weekday()) % 7
-        friday_17 = now_miami.replace(hour=17, minute=0, second=0, microsecond=0) + timedelta(days=days_until_friday)
-
-        is_open = False
-        # Сессия открыта если сейчас >= последнего открытия и < пятницы 17:00
-        # Но если сейчас пятница после 17:00, считаем закрыто
-        if now_miami >= next_open and now_miami < friday_17:
-            is_open = True
-        elif now_miami.weekday() == 4 and now_miami.hour >= 17:
-            is_open = False
-
-        if is_open:
-            # Считаем время до закрытия пятницы 17:00
-            time_to_close = friday_17 - now_miami
-            result[name] = {
-                "status": "open",
-                "relative_seconds": int(time_to_close.total_seconds()),
-                "formatted_delta": format_timedelta(time_to_close),
-            }
-        else:
-            # Время до открытия
-            result[name] = {
-                "status": "closed",
-                "relative_seconds": int(delta.total_seconds()),
-                "formatted_delta": format_timedelta(delta),
-            }
-
-    return result
 
 def get_session_status_emoji(status, relative_seconds):
     if status == "open":
@@ -236,8 +211,10 @@ async def update_sessions_message():
     lines = []
     for market, info in sessions_info.items():
         emoji = get_session_status_emoji(info["status"], info["relative_seconds"])
-        status_text = "open — closes in" if info["status"] == "open" else "closed — opens in"
-        line = f"{emoji} {market}: {status_text} {info['formatted_delta']}"
+        if info["status"] == "closed":
+            line = f"{emoji} {market}: closed — opens in {info['formatted_delta']}"
+        else:
+            line = f"{emoji} {market}: open — closes in {info['formatted_delta']}"
         lines.append(line)
 
     footer = "\n\n "
@@ -248,7 +225,6 @@ async def update_sessions_message():
         logger.error("Sessions channel not found")
         return
 
-    # Если сообщение уже создано — редактируем, иначе создаём новое
     if last_values.get("sessions_msg_id"):
         try:
             msg = await channel.fetch_message(last_values["sessions_msg_id"])
@@ -258,7 +234,6 @@ async def update_sessions_message():
                 last_values["sessions_last_update"] = now_utc
                 logger.info("Обновлено сообщение сессий")
         except (discord.NotFound, discord.Forbidden):
-            # Сообщение удалено или недоступно, создаём заново
             msg = await channel.send(content)
             last_values["sessions_msg_id"] = msg.id
             last_values["sessions_msg_content"] = content
@@ -271,37 +246,59 @@ async def update_sessions_message():
         last_values["sessions_last_update"] = now_utc
         logger.info("Создано новое сообщение сессий")
 
-# ===== Main background task =====
-@tasks.loop(seconds=30)
-async def update_data_loop():
+# ===== Background tasks =====
+@tasks.loop(minutes=6)
+async def update_prices():
     async with aiohttp.ClientSession() as session:
         btc_price, btc_vol = await get_price_and_volume(session, "bitcoin")
         eth_price, eth_vol = await get_price_and_volume(session, "ethereum")
-        fng = await get_fear_and_greed(session)
 
         if btc_price is not None:
             await update_channel_if_changed(BTC_PRICE_CHANNEL_ID, f"BTC: ${btc_price:,.2f}", "btc_price")
         if eth_price is not None:
             await update_channel_if_changed(ETH_PRICE_CHANNEL_ID, f"ETH: ${eth_price:,.2f}", "eth_price")
+
         if btc_vol is not None:
             await update_channel_if_changed(BTC_VOL_CHANNEL_ID, f"BTC Vol: {format_volume(btc_vol)}", "btc_vol")
         if eth_vol is not None:
             await update_channel_if_changed(ETH_VOL_CHANNEL_ID, f"ETH Vol: {format_volume(eth_vol)}", "eth_vol")
+
+@tasks.loop(minutes=43)
+async def update_fng():
+    async with aiohttp.ClientSession() as session:
+        fng = await get_fear_and_greed(session)
         if fng is not None:
             await update_channel_if_changed(FNG_CHANNEL_ID, f"Fear & Greed: {fng}", "fng")
 
-    await update_sessions_message()
+@tasks.loop(minutes=17)
+async def health_ping():
+    if not HEALTH_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(HEALTH_URL) as resp:
+                if resp.status == 200:
+                    logger.info("✅ HEALTH URL pinged")
+                else:
+                    logger.warning(f"Health ping returned status {resp.status}")
+    except Exception as e:
+        logger.error(f"Health ping failed: {e}")
 
-@update_data_loop.before_loop
-async def before_update():
-    await bot.wait_until_ready()
-    logger.info("Bot is ready, starting update loop")
+@tasks.loop(seconds=60)
+async def update_sessions():
+    try:
+        await update_sessions_message()
+    except Exception as e:
+        logger.error(f"Error in update_sessions task: {e}")
 
+# ===== Startup =====
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot started as {bot.user}")
-    if not update_data_loop.is_running():
-        update_data_loop.start()
+    update_prices.start()
+    update_fng.start()
+    update_sessions.start()
+    health_ping.start()
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
