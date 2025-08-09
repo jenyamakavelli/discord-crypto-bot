@@ -6,7 +6,7 @@ import discord
 from discord.ext import tasks, commands
 from flask import Flask
 from threading import Thread
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 import pytz
 
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +47,7 @@ last_values = {
     "fng": None,
     "sessions_msg_id": None,
     "sessions_msg_content": None,
+    "sessions_last_update": None,
 }
 
 # ===== Async HTTP fetch with retry and backoff for rate limits =====
@@ -118,37 +119,54 @@ async def update_channel_if_changed(channel_id, new_name, key):
 
 # ===== Market sessions handling =====
 
-# Майами таймзона для расчётов
 MIAMI_TZ = pytz.timezone("America/New_York")
+
+def get_next_weekday(base_date, target_weekday):
+    """Возвращает дату ближайшего target_weekday (0=Пн) >= base_date"""
+    days_ahead = (target_weekday - base_date.weekday()) % 7
+    return base_date + timedelta(days=days_ahead)
 
 def get_market_status(market_name, now_miami):
     """
-    Рассчитывает статус рынка (open/closed) и время до закрытия или открытия.
-    Учитывает выходные:
-      - Рынки закрыты с пятницы 17:00 до воскресенья 17:00 (по Майами).
-      - Рынки открыты в другое время.
+    Рассчитывает статус рынка (open/closed/soon) и время до закрытия или открытия.
+    Учёт выходных:
+    - Рынки закрыты с пятницы 17:00 по Майами до воскресенья 17:00 по Майами.
+    - Открываются в воскресенье 17:00.
+    - Закрываются в пятницу 17:00.
     """
-    # Ближайшая пятница 17:00
-    days_until_friday = (4 - now_miami.weekday()) % 7
-    this_friday_17 = (now_miami + timedelta(days=days_until_friday)).replace(hour=17, minute=0, second=0, microsecond=0)
 
-    # Ближайшее воскресенье 17:00
-    days_until_sunday = (6 - now_miami.weekday()) % 7
-    this_sunday_17 = (now_miami + timedelta(days=days_until_sunday)).replace(hour=17, minute=0, second=0, microsecond=0)
+    # Выходные границы
+    this_friday_17 = get_next_weekday(now_miami, 4).replace(hour=17, minute=0, second=0, microsecond=0)
+    this_sunday_17 = get_next_weekday(now_miami, 6).replace(hour=17, minute=0, second=0, microsecond=0)
 
-    # Выходные: пятница 17:00 <= now < воскресенье 17:00
+    # Если сейчас после воскресенья 17:00, обновляем пятницу и воскресенье на следующую неделю
+    if now_miami >= this_sunday_17:
+        this_friday_17 = this_friday_17 + timedelta(days=7)
+        this_sunday_17 = this_sunday_17 + timedelta(days=7)
+
+    # Проверяем, в выходные ли сейчас
     if this_friday_17 <= now_miami < this_sunday_17:
+        # Рынки закрыты
         status = "closed"
         time_to_open = this_sunday_17 - now_miami
+        # Если время до открытия < 1 час, статус soon
+        if time_to_open.total_seconds() <= 3600:
+            status = "soon"
         return status, time_to_open
 
-    # В остальное время — открыто, время до пятницы 17:00
-    # Если сегодня пятница и после 17:00, то считаем пятницу следующей недели
-    if now_miami >= this_friday_17:
-        this_friday_17 += timedelta(days=7)
-
+    # Иначе рынки открыты
     status = "open"
-    time_to_close = this_friday_17 - now_miami
+    # Если сейчас пятница после 17:00 (то есть ещё не зашли в выходные), то время до закрытия след. пятницы
+    if now_miami >= this_friday_17:
+        next_friday_17 = this_friday_17 + timedelta(days=7)
+    else:
+        next_friday_17 = this_friday_17
+    time_to_close = next_friday_17 - now_miami
+
+    # Аналогично, если время до закрытия < 1 час, статус soon (на закрытие)
+    if time_to_close.total_seconds() <= 3600:
+        status = "soon"
+
     return status, time_to_close
 
 def format_timedelta(delta):
@@ -164,15 +182,15 @@ def format_timedelta(delta):
     parts.append(f"{minutes}m")
     return " ".join(parts)
 
-def get_session_status_emoji(status, relative_seconds):
+def get_session_status_emoji(status):
     if status == "open":
         return "🟢"
+    elif status == "soon":
+        return "🟡"
     elif status == "closed":
-        # Если открытие скоро — меньше часа, желтый
-        if relative_seconds <= 3600:
-            return "🟡"
         return "🔴"
-    return ""
+    else:
+        return ""
 
 def format_updated_since(last_update_dt, now_dt):
     diff = now_dt - last_update_dt
@@ -201,14 +219,16 @@ async def update_sessions_message():
             "formatted_delta": format_timedelta(delta),
         }
 
-    updated_text = format_updated_since(last_values.get("sessions_last_update", now_utc), now_utc)
+    last_update = last_values.get("sessions_last_update", now_utc)
+    updated_text = format_updated_since(last_update, now_utc)
+
     header = f"🕒 Market sessions (relative times, UTC) — {updated_text}\n\n"
 
     lines = []
     for market in markets:
         info = sessions_info[market]
-        emoji = get_session_status_emoji(info["status"], info["relative"])
-        status_text = "open — closes in" if info["status"] == "open" else "closed — opens in"
+        emoji = get_session_status_emoji(info["status"])
+        status_text = "open — closes in" if info["status"] == "open" or info["status"] == "soon" else "closed — opens in"
         line = f"{emoji} {market}: {status_text} {info['formatted_delta']}"
         lines.append(line)
 
@@ -221,7 +241,6 @@ async def update_sessions_message():
         return
 
     try:
-        # Проверяем есть ли сохранённое сообщение сессий
         msg_id = last_values.get("sessions_msg_id")
         msg = None
         if msg_id:
@@ -230,14 +249,12 @@ async def update_sessions_message():
             except discord.NotFound:
                 msg = None
         if msg is None:
-            # Отправляем новое сообщение
             msg = await channel.send(message)
             last_values["sessions_msg_id"] = msg.id
             last_values["sessions_msg_content"] = message
             last_values["sessions_last_update"] = now_utc
             logger.info("Sessions message sent (new)")
         else:
-            # Обновляем сообщение если содержимое изменилось
             if message != last_values.get("sessions_msg_content"):
                 await msg.edit(content=message)
                 last_values["sessions_msg_content"] = message
