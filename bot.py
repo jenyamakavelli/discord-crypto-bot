@@ -1,6 +1,8 @@
+from aiohttp import web
+import asyncio
 import discord
 from discord.ext import tasks
-import aiohttp
+import aiohttp as ahttp
 import os
 
 TOKEN = os.getenv("TOKEN")
@@ -12,18 +14,16 @@ client = discord.Client(intents=intents)
 
 async def get_prices():
     url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd"
-    async with aiohttp.ClientSession() as session:
+    async with ahttp.ClientSession() as session:
         async with session.get(url) as resp:
-            if resp.status != 200:
-                raise Exception(f"Ошибка API: {resp.status}")
+            resp.raise_for_status()
             data = await resp.json()
             return data["bitcoin"]["usd"], data["ethereum"]["usd"]
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=1)
 async def update_prices():
     try:
         btc_price, eth_price = await get_prices()
-
         btc_channel = client.get_channel(BTC_CHANNEL_ID)
         eth_channel = client.get_channel(ETH_CHANNEL_ID)
 
@@ -48,4 +48,22 @@ async def on_ready():
     if not update_prices.is_running():
         update_prices.start()
 
-client.run(TOKEN)
+# --- Health-check сервер ---
+async def handle_healthcheck(request):
+    return web.Response(text="OK")
+
+async def start_healthcheck_server():
+    app = web.Application()
+    app.router.add_get("/", handle_healthcheck)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8000)
+    await site.start()
+    print("🌐 HTTP health-check сервер запущен на порту 8000")
+
+async def main():
+    await start_healthcheck_server()
+    await client.start(TOKEN)
+
+import asyncio
+asyncio.run(main())
