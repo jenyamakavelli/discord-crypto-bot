@@ -13,14 +13,6 @@ client = discord.Client(intents=intents)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# Для хранения последних цен
-last_prices = {
-    "btc": None,
-    "eth": None
-}
-
-PRICE_UPDATE_THRESHOLD = 0.005  # 0.5% изменения цены
-
 async def get_prices():
     url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd"
     async with aiohttp.ClientSession() as session:
@@ -42,25 +34,17 @@ async def update_prices():
         btc_channel = client.get_channel(BTC_CHANNEL_ID)
         eth_channel = client.get_channel(ETH_CHANNEL_ID)
 
-        # Проверка, изменились ли цены более чем на 0.5%
-        def significant_change(old, new):
-            if old is None:
-                return True
-            return abs(new - old) / old >= PRICE_UPDATE_THRESHOLD
-
-        if btc_channel and significant_change(last_prices['btc'], btc_price):
+        if btc_channel:
             await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
             logging.info(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
-            last_prices['btc'] = btc_price
         else:
-            logging.info("ℹ️ Изменение цены BTC незначительное или канал не найден")
+            logging.warning("⚠️ BTC канал не найден")
 
-        if eth_channel and significant_change(last_prices['eth'], eth_price):
+        if eth_channel:
             await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
             logging.info(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
-            last_prices['eth'] = eth_price
         else:
-            logging.info("ℹ️ Изменение цены ETH незначительное или канал не найден")
+            logging.warning("⚠️ ETH канал не найден")
 
     except Exception as e:
         logging.error(f"⚠️ Ошибка обновления: {e}")
