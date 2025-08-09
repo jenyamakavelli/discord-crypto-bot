@@ -6,7 +6,7 @@ import discord
 from discord.ext import tasks, commands
 from flask import Flask
 from threading import Thread
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 import pytz
 
 logging.basicConfig(level=logging.INFO)
@@ -119,44 +119,39 @@ async def update_channel_if_changed(channel_id, new_name, key):
 
 # ===== Market sessions handling =====
 
+# Майами таймзона для расчётов
 MIAMI_TZ = pytz.timezone("America/New_York")
 
+# UTC-время открытия и закрытия сессий для каждого рынка (время указано в UTC)
+MARKET_SESSIONS = {
+    "Tokyo": {"open": time(0, 0), "close": time(6, 0)},     # 00:00 - 06:00 UTC (пример, уточнить для твоей логики)
+    "London": {"open": time(7, 0), "close": time(15, 0)},   # 07:00 - 15:00 UTC
+    "New York": {"open": time(12, 0), "close": time(20, 0)},# 12:00 - 20:00 UTC
+}
+
 def get_friday_17(now_miami):
-    friday = now_miami.replace(hour=17, minute=0, second=0, microsecond=0)
-    days_to_friday = (4 - now_miami.weekday()) % 7
-    friday = friday + timedelta(days=days_to_friday)
-    if now_miami >= friday:
-        friday += timedelta(days=7)
-    return friday
+    days_until_friday = (4 - now_miami.weekday()) % 7
+    friday_17 = (now_miami + timedelta(days=days_until_friday)).replace(hour=17, minute=0, second=0, microsecond=0)
+    if friday_17 < now_miami:
+        friday_17 += timedelta(days=7)
+    return friday_17
 
 def get_sunday_17(now_miami):
-    sunday = now_miami.replace(hour=17, minute=0, second=0, microsecond=0)
-    days_to_sunday = (6 - now_miami.weekday()) % 7
-    sunday = sunday + timedelta(days=days_to_sunday)
-    if now_miami >= sunday:
-        sunday += timedelta(days=7)
-    return sunday
+    days_until_sunday = (6 - now_miami.weekday()) % 7
+    sunday_17 = (now_miami + timedelta(days=days_until_sunday)).replace(hour=17, minute=0, second=0, microsecond=0)
+    if sunday_17 < now_miami:
+        sunday_17 += timedelta(days=7)
+    return sunday_17
 
-def get_market_status(market_name, now_miami):
-    # Все рынки закрыты с пятницы 17:00 по Майами до воскресенья 17:00 по Майами
-    this_friday_17 = get_friday_17(now_miami)
-    this_sunday_17 = get_sunday_17(now_miami)
-
-    if this_friday_17 <= now_miami < this_sunday_17:
-        status = "closed"
-        time_to_open = this_sunday_17 - now_miami
-        return status, time_to_open
-
-    # Иначе рынок открыт — закрывается в пятницу 17:00
-    if now_miami >= this_friday_17:
-        this_friday_17 += timedelta(days=7)
-
-    status = "open"
-    time_to_close = this_friday_17 - now_miami
-    return status, time_to_close
+def is_weekend(now_miami):
+    friday_17 = get_friday_17(now_miami)
+    sunday_17 = get_sunday_17(now_miami)
+    return friday_17 <= now_miami < sunday_17
 
 def format_timedelta(delta):
     total_seconds = int(delta.total_seconds())
+    if total_seconds < 0:
+        return "0m"
     days, remainder = divmod(total_seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
@@ -191,27 +186,70 @@ def format_updated_since(last_update_dt, now_dt):
         hours = int(seconds // 3600)
         return f"обновлено {hours} ч назад"
 
-async def update_sessions_message():
-    now_utc = datetime.now(timezone.utc)
-    now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
+def get_market_status(market_name, now_utc, now_miami):
+    # Проверяем выходные - глобальное закрытие для всех рынков
+    if is_weekend(now_miami):
+        time_to_open = get_sunday_17(now_miami) - now_miami
+        return "closed", time_to_open
 
-    last_update = last_values.get("sessions_last_update")
-    if last_update is None:
-        last_update = now_utc
-        last_values["sessions_last_update"] = now_utc
+    session = MARKET_SESSIONS.get(market_name)
+    if not session:
+        # Если рынок не найден, считаем его закрытым на 7 дней
+        return "closed", timedelta(days=7)
+
+    open_time = session["open"]
+    close_time = session["close"]
+
+    now_time = now_utc.time()
+
+    # Проверка, открыт ли рынок сейчас
+    if open_time <= close_time:
+        # обычный диапазон (без перехода через полночь)
+        if open_time <= now_time < close_time:
+            close_dt = datetime.combine(now_utc.date(), close_time, tzinfo=timezone.utc)
+            if now_utc > close_dt:
+                close_dt += timedelta(days=1)
+            return "open", close_dt - now_utc
+        else:
+            open_dt = datetime.combine(now_utc.date(), open_time, tzinfo=timezone.utc)
+            if now_utc >= open_dt:
+                open_dt += timedelta(days=1)
+            return "closed", open_dt - now_utc
+    else:
+        # сессия пересекает полночь (например 22:00 - 06:00)
+        if now_time >= open_time or now_time < close_time:
+            # открыт
+            close_dt = datetime.combine(now_utc.date(), close_time, tzinfo=timezone.utc)
+            if now_time < close_time:
+                # закрытие сегодня
+                pass
+            else:
+                # закрытие завтра
+                close_dt += timedelta(days=1)
+            return "open", close_dt - now_utc
+        else:
+            # закрыт
+            open_dt = datetime.combine(now_utc.date(), open_time, tzinfo=timezone.utc)
+            if now_time >= close_time:
+                open_dt += timedelta(days=1)
+            return "closed", open_dt - now_utc
+
+async def update_sessions_message():
+    now_utc = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
 
     markets = ["Tokyo", "London", "New York"]
     sessions_info = {}
 
     for market in markets:
-        status, delta = get_market_status(market, now_miami)
+        status, delta = get_market_status(market, now_utc, now_miami)
         sessions_info[market] = {
             "status": status,
             "relative": int(delta.total_seconds()),
             "formatted_delta": format_timedelta(delta),
         }
 
-    updated_text = format_updated_since(last_update, now_utc)
+    updated_text = format_updated_since(last_values.get("sessions_last_update"), now_utc)
     header = f"🕒 Market sessions (relative times, UTC) — {updated_text}\n\n"
 
     lines = []
