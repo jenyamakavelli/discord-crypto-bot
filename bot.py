@@ -112,7 +112,7 @@ async def update_channel_if_changed(channel_id, new_name, key):
                 logger.error(f"Ошибка обновления канала {channel_id}: {e}")
 
 # ===== Tasks =====
-@tasks.loop(minutes=3)
+@tasks.loop(minutes=4)
 async def update_prices():
     async with aiohttp.ClientSession() as session:
         btc_price, _ = await get_price_and_volume(session, "bitcoin")
@@ -132,14 +132,14 @@ async def update_volumes():
         if eth_vol is not None:
             await update_channel_if_changed(ETH_VOL_CHANNEL_ID, f"ETH Vol: {format_volume(eth_vol)}", "eth_vol")
 
-@tasks.loop(minutes=45)
+@tasks.loop(minutes=43)
 async def update_fng():
     async with aiohttp.ClientSession() as session:
         fng_value = await get_fear_and_greed(session)
         if fng_value is not None:
             await update_channel_if_changed(FNG_CHANNEL_ID, f"Fear & Greed: {fng_value}", "fng")
 
-@tasks.loop(minutes=10)
+@tasks.loop(minutes=9)
 async def ping_health():
     if HEALTH_URL:
         try:
