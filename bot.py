@@ -240,7 +240,7 @@ async def update_sessions_message():
         line = f"{emoji} {market}: {status_text} {info['formatted_delta']}"
         lines.append(line)
 
-    footer = "\n\n⚠️ Countdown is relative (D days Hh Mm). Gap alerts posted for session opens."
+    footer = "\n\n "
     content = header + "\n".join(lines) + footer
 
     channel = bot.get_channel(SESSIONS_CHANNEL_ID)
