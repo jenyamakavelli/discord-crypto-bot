@@ -36,9 +36,9 @@ COINGECKO_API = "https://api.coingecko.com/api/v3"
 FNG_API = "https://api.alternative.me/fng/"
 
 # ======= Кэш для отслеживания изменений =======
-last_prices = {"btc": None, "eth": None}
+last_prices = {"bitcoin": None, "ethereum": None}
 last_fng = None
-last_volumes = {"btc": None, "eth": None}
+last_volumes = {"bitcoin": None, "ethereum": None}
 
 # ======= Форматирование объёмов =======
 def format_volume(value: float) -> str:
@@ -52,15 +52,6 @@ def format_volume(value: float) -> str:
         return f"{value:.0f}"
 
 # ======= Функции обновления =======
-async def fetch_json(session: ClientSession, url: str):
-    try:
-        async with session.get(url, timeout=10) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-    except Exception as e:
-        logger.warning(f"Ошибка запроса {url}: {e}")
-        return None
-
 async def update_price(session: ClientSession, coin_id: str, channel_id: int):
     global last_prices
     url = f"{COINGECKO_API}/simple/price?ids={coin_id}&vs_currencies=usd"
@@ -79,23 +70,6 @@ async def update_price(session: ClientSession, coin_id: str, channel_id: int):
             except discord.HTTPException as e:
                 logger.warning(f"Discord rate limit или ошибка при обновлении канала {channel_id}: {e}")
 
-async def update_fng(session: ClientSession):
-    global last_fng
-    data = await fetch_json(session, FNG_API)
-    if not data or "data" not in data or len(data["data"]) == 0:
-        return
-    value = int(data["data"][0]["value"])
-    if last_fng != value:
-        last_fng = value
-        channel = bot.get_channel(FNG_CHANNEL_ID)
-        if channel:
-            text = f"Fear & Greed: {value}"
-            try:
-                await channel.edit(name=text)
-                logger.info(f"Обновлено имя канала {FNG_CHANNEL_ID}: {text}")
-            except discord.HTTPException as e:
-                logger.warning(f"Discord rate limit или ошибка при обновлении канала FNG: {e}")
-
 async def update_volumes(session: ClientSession):
     global last_volumes
     url = f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids=bitcoin,ethereum"
@@ -109,8 +83,8 @@ async def update_volumes(session: ClientSession):
     formatted_btc_vol = f"${format_volume(btc_volume)}"
     formatted_eth_vol = f"${format_volume(eth_volume)}"
 
-    if last_volumes["btc"] != btc_volume:
-        last_volumes["btc"] = btc_volume
+    if last_volumes["bitcoin"] != btc_volume:
+        last_volumes["bitcoin"] = btc_volume
         channel = bot.get_channel(BTC_VOLUME_CHANNEL_ID)
         if channel:
             text = f"BTC Vol: {formatted_btc_vol}"
@@ -120,8 +94,8 @@ async def update_volumes(session: ClientSession):
             except discord.HTTPException as e:
                 logger.warning(f"Discord rate limit или ошибка при обновлении канала BTC Vol: {e}")
 
-    if last_volumes["eth"] != eth_volume:
-        last_volumes["eth"] = eth_volume
+    if last_volumes["ethereum"] != eth_volume:
+        last_volumes["ethereum"] = eth_volume
         channel = bot.get_channel(ETH_VOLUME_CHANNEL_ID)
         if channel:
             text = f"ETH Vol: {formatted_eth_vol}"
