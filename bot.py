@@ -3,6 +3,7 @@ import discord
 from discord.ext import tasks
 import aiohttp
 import logging
+import asyncio
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
@@ -18,7 +19,7 @@ async def get_prices():
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status != 200:
-                raise Exception(f"Ошибка HTTP {resp.status} при запросе цен")
+                raise Exception(f"HTTP error {resp.status} fetching prices")
             data = await resp.json()
             btc_price = data['bitcoin']['usd']
             eth_price = data['ethereum']['usd']
@@ -35,19 +36,36 @@ async def update_prices():
         eth_channel = client.get_channel(ETH_CHANNEL_ID)
 
         if btc_channel:
-            await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
-            logging.info(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
+            try:
+                await btc_channel.edit(name=f"BTC: ${btc_price:,.2f}")
+                logging.info(f"✅ Обновлено имя BTC канала: BTC: ${btc_price:,.2f}")
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = int(e.response.headers.get("Retry-After", "10"))
+                    logging.warning(f"⚠️ Rate limited on BTC channel update, retrying after {retry_after} seconds")
+                    await asyncio.sleep(retry_after)
+                else:
+                    logging.error(f"Ошибка обновления BTC канала: {e}")
         else:
             logging.warning("⚠️ BTC канал не найден")
 
         if eth_channel:
-            await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
-            logging.info(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
+            try:
+                await eth_channel.edit(name=f"ETH: ${eth_price:,.2f}")
+                logging.info(f"✅ Обновлено имя ETH канала: ETH: ${eth_price:,.2f}")
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = int(e.response.headers.get("Retry-After", "10"))
+                    logging.warning(f"⚠️ Rate limited on ETH channel update, retrying after {retry_after} seconds")
+                    await asyncio.sleep(retry_after)
+                else:
+                    logging.error(f"Ошибка обновления ETH канала: {e}")
         else:
             logging.warning("⚠️ ETH канал не найден")
 
     except Exception as e:
         logging.error(f"⚠️ Ошибка обновления: {e}")
+
     logging.info("✅ Обновление цен завершено")
 
 @client.event
