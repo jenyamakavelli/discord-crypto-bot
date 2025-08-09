@@ -1,98 +1,93 @@
 import os
 import asyncio
 import logging
+from flask import Flask
+from threading import Thread
 import aiohttp
 import discord
 from discord.ext import commands, tasks
-from aiohttp import web
 
-# ------------------ ЛОГИ ------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)-8s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-)
-log = logging.getLogger(__name__)
+# ==== ЛОГИ ====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# ------------------ ENV ------------------
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-BTC_CHANNEL_ID = os.getenv("BTC_CHANNEL_ID")
-ETH_CHANNEL_ID = os.getenv("ETH_CHANNEL_ID")
-PORT = int(os.getenv("PORT", 8000))  # Для Koyeb health-check
+# ==== HTTP СЕРВЕР ДЛЯ KOYEB ====
+app = Flask(__name__)
 
-if not all([DISCORD_TOKEN, BTC_CHANNEL_ID, ETH_CHANNEL_ID]):
-    log.error("❌ Не заданы переменные окружения: DISCORD_TOKEN, BTC_CHANNEL_ID, ETH_CHANNEL_ID")
-    exit(1)
+@app.route("/")
+def health():
+    return "OK", 200
 
-BTC_CHANNEL_ID = int(BTC_CHANNEL_ID)
-ETH_CHANNEL_ID = int(ETH_CHANNEL_ID)
+def run_web():
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
 
-# ------------------ DISCORD ------------------
+def keep_alive():
+    t = Thread(target=run_web)
+    t.daemon = True
+    t.start()
+
+# ==== DISCORD БОТ ====
+TOKEN = os.getenv("DISCORD_TOKEN")
+BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID", 0))
+ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID", 0))
+HEALTH_URL = os.getenv("HEALTH_URL")  # URL сервиса на Koyeb (для self-ping)
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ------------------ ПОЛУЧЕНИЕ ЦЕН ------------------
-async def fetch_price(session, coin_id):
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": coin_id, "vs_currencies": "usd"}
-    async with session.get(url, params=params) as resp:
-        if resp.status != 200:
-            log.warning(f"⚠️ Ошибка API {coin_id}: {resp.status}")
-            return None
-        data = await resp.json()
-        return data.get(coin_id, {}).get("usd")
+last_prices = {"BTC": None, "ETH": None}
 
-async def update_channel_name(channel_id, name):
-    channel = bot.get_channel(channel_id)
-    if channel:
-        try:
-            await channel.edit(name=name)
-        except discord.errors.HTTPException as e:
-            log.warning(f"⚠️ Rate limit при обновлении {channel_id}: {e}")
+async def fetch_price(coin_id):
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.json()
+            return float(data[coin_id]["usd"])
 
-# ------------------ ОБНОВЛЕНИЕ ЦЕН ------------------
 @tasks.loop(minutes=3)
 async def update_prices():
-    log.info("🔄 Начинаю обновление цен")
-    async with aiohttp.ClientSession() as session:
-        btc_price = await fetch_price(session, "bitcoin")
-        eth_price = await fetch_price(session, "ethereum")
+    logger.info("🔄 Начинаю обновление цен")
+    try:
+        btc_price = await fetch_price("bitcoin")
+        eth_price = await fetch_price("ethereum")
+        logger.info(f"💰 BTC: {btc_price}, ETH: {eth_price}")
 
-    if btc_price:
-        await update_channel_name(BTC_CHANNEL_ID, f"BTC: ${btc_price:,.2f}")
-        log.info(f"💰 Обновлено BTC: ${btc_price:,.2f}")
-    else:
-        log.warning("⚠️ Не удалось получить цену BTC")
+        last_prices["BTC"] = btc_price
+        last_prices["ETH"] = eth_price
 
-    if eth_price:
-        await update_channel_name(ETH_CHANNEL_ID, f"ETH: ${eth_price:,.2f}")
-        log.info(f"💰 Обновлено ETH: ${eth_price:,.2f}")
-    else:
-        log.warning("⚠️ Не удалось получить цену ETH")
+        btc_channel = bot.get_channel(BTC_CHANNEL_ID)
+        eth_channel = bot.get_channel(ETH_CHANNEL_ID)
+
+        if btc_channel:
+            await btc_channel.edit(name=f"BTC: {btc_price:,.2f}$")
+        if eth_channel:
+            await eth_channel.edit(name=f"ETH: {eth_price:,.2f}$")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении цен: {e}")
+
+@tasks.loop(minutes=4)
+async def self_ping():
+    if not HEALTH_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(HEALTH_URL) as resp:
+                logger.info(f"Self-ping: {resp.status}")
+    except Exception as e:
+        logger.warning(f"Ошибка self-ping: {e}")
 
 @bot.event
 async def on_ready():
-    log.info(f"✅ Бот запущен как {bot.user}")
+    logger.info(f"✅ Бот запущен как {bot.user}")
     update_prices.start()
-    log.info("🟢 Задача обновления цен запущена")
-
-# ------------------ HEALTH-CHECK ------------------
-async def handle_health(_):
-    return web.Response(text="OK", status=200)
-
-async def start_webserver():
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info(f"🌐 Health-check сервер запущен на порту {PORT}")
-
-# ------------------ ЗАПУСК ------------------
-async def main():
-    await start_webserver()
-    await bot.start(DISCORD_TOKEN)
+    self_ping.start()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if not TOKEN or not BTC_CHANNEL_ID or not ETH_CHANNEL_ID:
+        logger.error("❌ Нет переменных окружения DISCORD_TOKEN, BTC_CHANNEL_ID или ETH_CHANNEL_ID")
+        exit(1)
+
+    keep_alive()  # Запускаем веб-сервер для health-check
+    bot.run(TOKEN)
