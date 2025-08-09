@@ -1,100 +1,117 @@
 import os
-import asyncio
 import logging
 import requests
+import discord
+from discord.ext import tasks, commands
 from flask import Flask
 from threading import Thread
-import discord
-from discord.ext import tasks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
-ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
-FEAR_GREED_CHANNEL_ID = int(os.getenv("FEAR_GREED_CHANNEL_ID"))
+# ==================== CONFIG ====================
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+BTC_PRICE_CHANNEL_ID = int(os.getenv("BTC_PRICE_CHANNEL_ID"))
+ETH_PRICE_CHANNEL_ID = int(os.getenv("ETH_PRICE_CHANNEL_ID"))
+FNG_CHANNEL_ID = int(os.getenv("FNG_CHANNEL_ID"))
 BTC_VOL_CHANNEL_ID = int(os.getenv("BTC_VOL_CHANNEL_ID"))
 ETH_VOL_CHANNEL_ID = int(os.getenv("ETH_VOL_CHANNEL_ID"))
+HEALTH_URL = os.getenv("HEALTH_URL")  # Для Koyeb Ping
+# =================================================
 
-# HTTP server to keep Koyeb alive
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ===== Flask health server =====
 app = Flask(__name__)
 
 @app.route("/")
-def health():
-    return "OK", 200
+def home():
+    return "Bot is running!"
 
 def run_flask():
-    port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=8000)
 
-# Start Flask in a separate thread
 Thread(target=run_flask).start()
 
-# Discord bot setup
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+# ===== API функции =====
+def get_price_and_volume(symbol_id):
+    url = f"https://api.coingecko.com/api/v3/coins/{symbol_id}"
+    r = requests.get(url)
+    if r.status_code != 200:
+        logger.warning(f"Ошибка CoinGecko для {symbol_id}: {r.status_code}")
+        return None, None
+    data = r.json()
+    price = data["market_data"]["current_price"]["usd"]
+    vol = data["market_data"]["total_volume"]["usd"]
+    return price, vol
 
-# Format large numbers to short form (e.g. 1.2B, 500M)
-def format_large_number(num):
-    for unit in ["", "K", "M", "B", "T"]:
-        if abs(num) < 1000:
-            return f"{num:.1f}{unit}"
-        num /= 1000
-    return f"{num:.1f}P"
+def get_fear_and_greed():
+    url = "https://api.alternative.me/fng/"
+    r = requests.get(url)
+    if r.status_code != 200:
+        logger.warning(f"Ошибка FNG API: {r.status_code}")
+        return None
+    return int(r.json()["data"][0]["value"])
 
+def format_volume(vol):
+    if vol >= 1_000_000_000:
+        return f"${vol/1_000_000_000:.1f}B"
+    elif vol >= 1_000_000:
+        return f"${vol/1_000_000:.1f}M"
+    else:
+        return f"${vol:,.0f}"
+
+# ===== Discord задачи =====
+@tasks.loop(minutes=5)
 async def update_prices():
     logger.info("🔄 Обновляю цены BTC и ETH...")
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                         params={"ids": "bitcoin,ethereum", "vs_currencies": "usd"})
-        data = r.json()
-        btc_price = data["bitcoin"]["usd"]
-        eth_price = data["ethereum"]["usd"]
+    btc_price, _ = get_price_and_volume("bitcoin")
+    eth_price, _ = get_price_and_volume("ethereum")
 
-        await client.get_channel(BTC_CHANNEL_ID).edit(name=f"BTC: ${btc_price:,.2f}")
-        await client.get_channel(ETH_CHANNEL_ID).edit(name=f"ETH: ${eth_price:,.2f}")
-        logger.info(f"Обновлены цены BTC и ETH: {btc_price}, {eth_price}")
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении цен: {e}")
+    if btc_price:
+        channel = bot.get_channel(BTC_PRICE_CHANNEL_ID)
+        await channel.edit(name=f"BTC: ${btc_price:,.2f}")
+    if eth_price:
+        channel = bot.get_channel(ETH_PRICE_CHANNEL_ID)
+        await channel.edit(name=f"ETH: ${eth_price:,.2f}")
 
-async def update_fear_greed():
-    logger.info("🔄 Обновляю индекс страха и жадности...")
-    try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1&format=json")
-        value = r.json()["data"][0]["value"]
-        await client.get_channel(FEAR_GREED_CHANNEL_ID).edit(name=f"Fear & Greed: {value}")
-        logger.info(f"Обновлён индекс страха и жадности: {value}")
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении индекса: {e}")
-
+@tasks.loop(minutes=15)
 async def update_volumes():
     logger.info("🔄 Обновляю объёмы торгов...")
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
-                         params={"vs_currency": "usd", "ids": "bitcoin,ethereum"})
-        data = {coin["id"]: coin["total_volume"] for coin in r.json()}
+    _, btc_vol = get_price_and_volume("bitcoin")
+    _, eth_vol = get_price_and_volume("ethereum")
 
-        btc_vol = format_large_number(data["bitcoin"])
-        eth_vol = format_large_number(data["ethereum"])
+    if btc_vol:
+        channel = bot.get_channel(BTC_VOL_CHANNEL_ID)
+        await channel.edit(name=f"BTC Vol: {format_volume(btc_vol)}")
+    if eth_vol:
+        channel = bot.get_channel(ETH_VOL_CHANNEL_ID)
+        await channel.edit(name=f"ETH Vol: {format_volume(eth_vol)}")
 
-        await client.get_channel(BTC_VOL_CHANNEL_ID).edit(name=f"BTC Vol: ${btc_vol}")
-        await client.get_channel(ETH_VOL_CHANNEL_ID).edit(name=f"ETH Vol: ${eth_vol}")
+@tasks.loop(minutes=30)
+async def update_fng():
+    logger.info("🔄 Обновляю индекс страха и жадности...")
+    fng_value = get_fear_and_greed()
+    if fng_value is not None:
+        channel = bot.get_channel(FNG_CHANNEL_ID)
+        await channel.edit(name=f"Fear & Greed: {fng_value}")
 
-        logger.info(f"Обновлены объёмы: BTC {btc_vol}, ETH {eth_vol}")
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении объёмов: {e}")
+@tasks.loop(minutes=10)
+async def ping_health():
+    if HEALTH_URL:
+        try:
+            requests.get(HEALTH_URL)
+            logger.info("✅ HEALTH URL пингован")
+        except:
+            logger.warning("⚠️ Ошибка пинга HEALTH URL")
 
-@tasks.loop(minutes=5)
-async def update_all():
-    await update_prices()
-    await update_fear_greed()
-    await update_volumes()
-
-@client.event
+@bot.event
 async def on_ready():
-    logger.info(f"✅ Бот запущен как {client.user}")
-    update_all.start()
+    logger.info(f"✅ Бот запущен как {bot.user}")
+    update_prices.start()
+    update_volumes.start()
+    update_fng.start()
+    ping_health.start()
 
-if __name__ == "__main__":
-    client.run(TOKEN)
+bot.run(DISCORD_TOKEN)
