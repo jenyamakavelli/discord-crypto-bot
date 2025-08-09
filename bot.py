@@ -231,7 +231,7 @@ async def update_sessions_message():
     sessions_info = get_sessions_status(now_utc)
 
     updated_text = format_updated_since(last_values.get("sessions_last_update"), now_utc)
-    header = f"🕒 Market sessions (relative times, UTC) — {updated_text}\n\n"
+    header = f"🕒 Форекс сессии — {updated_text}\n\n"
 
     lines = []
     for market, info in sessions_info.items():
