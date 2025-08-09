@@ -1,115 +1,118 @@
 import os
 import asyncio
-import aiohttp
 import logging
+import aiohttp
 from discord.ext import commands, tasks
 import discord
 
 logging.basicConfig(level=logging.INFO)
 
-# ENV переменные
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
+
 BTC_CHANNEL_ID = int(os.getenv("BTC_CHANNEL_ID"))
 ETH_CHANNEL_ID = int(os.getenv("ETH_CHANNEL_ID"))
 FNG_CHANNEL_ID = int(os.getenv("FNG_CHANNEL_ID"))
-BINANCE_VOLUME_CHANNEL_ID = int(os.getenv("BINANCE_VOLUME_CHANNEL_ID"))
-COINBASE_VOLUME_CHANNEL_ID = int(os.getenv("COINBASE_VOLUME_CHANNEL_ID"))
+BINANCE_VOLUME_CHANNEL_ID = None  # убрали Binance, не нужен
+COINGECKO_VOLUME_CHANNEL_ID = int(os.getenv("COINGECKO_VOLUME_CHANNEL_ID"))
 
 intents = discord.Intents.default()
 client = commands.Bot(command_prefix="!", intents=intents)
 
-# Для отслеживания последних значений
-last_btc_price = 0
-last_eth_price = 0
-last_fng = ""
-last_binance_volume = 0
-last_coinbase_volume = 0
+last_prices = {"btc": None, "eth": None}
+last_fng = None
+last_volumes = {"btc": None, "eth": None}
 
-async def fetch_json(url, session):
-    try:
-        async with session.get(url, timeout=10) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            else:
-                logging.warning(f"Ошибка запроса {url}: статус {resp.status}")
-    except Exception as e:
-        logging.warning(f"Ошибка запроса {url}: {e}")
-    return None
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (compatible; CryptoPriceBot/1.0)"
+}
 
-async def update_channel_name(channel_id, new_name):
-    channel = client.get_channel(channel_id)
-    if channel and channel.name != new_name:
-        try:
-            await channel.edit(name=new_name)
-            logging.info(f"Обновлено имя канала {channel_id}: {new_name}")
-        except Exception as e:
-            logging.warning(f"Ошибка обновления канала {channel_id}: {e}")
+async def fetch_json(session, url, params=None):
+    async with session.get(url, params=params, headers=HEADERS) as resp:
+        resp.raise_for_status()
+        return await resp.json()
 
 @tasks.loop(minutes=3)
-async def update_prices():
-    global last_btc_price, last_eth_price
-    logging.info("🔄 Обновляю цены BTC и ETH...")
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(url, session)
-        if data:
-            btc_price = data.get("bitcoin", {}).get("usd", 0)
-            eth_price = data.get("ethereum", {}).get("usd", 0)
-            if btc_price != last_btc_price:
-                await update_channel_name(BTC_CHANNEL_ID, f"BTC: ${btc_price:,.2f}")
-                last_btc_price = btc_price
-            if eth_price != last_eth_price:
-                await update_channel_name(ETH_CHANNEL_ID, f"ETH: ${eth_price:,.2f}")
-                last_eth_price = eth_price
+async def update_prices_and_volumes():
+    global last_prices, last_volumes
+    logging.info("🔄 Обновляю цены и объемы BTC и ETH с CoinGecko...")
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "ids": "bitcoin,ethereum",
+        "order": "market_cap_desc",
+        "per_page": 2,
+        "page": 1,
+        "sparkline": "false"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await fetch_json(session, url, params)
+            btc_data = data[0]
+            eth_data = data[1]
 
-@tasks.loop(minutes=15)
-async def update_fng():
+            btc_price = round(btc_data["current_price"], 2)
+            eth_price = round(eth_data["current_price"], 2)
+            btc_volume = int(btc_data["total_volume"])
+            eth_volume = int(eth_data["total_volume"])
+
+            # Обновление цен BTC
+            if last_prices["btc"] != btc_price:
+                channel = client.get_channel(BTC_CHANNEL_ID)
+                if channel:
+                    await channel.edit(name=f"BTC: ${btc_price:,}")
+                    logging.info(f"Обновлено имя канала BTC: BTC: ${btc_price:,}")
+                last_prices["btc"] = btc_price
+
+            # Обновление цен ETH
+            if last_prices["eth"] != eth_price:
+                channel = client.get_channel(ETH_CHANNEL_ID)
+                if channel:
+                    await channel.edit(name=f"ETH: ${eth_price:,}")
+                    logging.info(f"Обновлено имя канала ETH: ETH: ${eth_price:,}")
+                last_prices["eth"] = eth_price
+
+            # Обновление объемов BTC
+            if last_volumes["btc"] != btc_volume:
+                channel = client.get_channel(COINGECKO_VOLUME_CHANNEL_ID)
+                if channel:
+                    await channel.edit(name=f"BTC Vol: ${btc_volume:,}")
+                    logging.info(f"Обновлено имя канала BTC Vol: ${btc_volume:,}")
+                last_volumes["btc"] = btc_volume
+
+            # Обновление объемов ETH
+            if last_volumes["eth"] != eth_volume:
+                # Для наглядности можно добавить канал для ETH объемов, если нужно
+                # Или объединить с BTC объемом в один канал
+                pass  # здесь пока не реализуем, чтобы не усложнять
+                last_volumes["eth"] = eth_volume
+
+    except Exception as e:
+        logging.warning(f"Ошибка при обновлении цен и объемов: {e}")
+
+@tasks.loop(minutes=30)
+async def update_fear_and_greed():
     global last_fng
     logging.info("🔄 Обновляю индекс страха и жадности...")
-    url = "https://api.alternative.me/fng/?limit=1"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(url, session)
-        if data and "data" in data and len(data["data"]) > 0:
-            fng_value = data["data"][0].get("value", "")
-            fng_str = f"Fear & Greed: {fng_value}"
-            if fng_str != last_fng:
-                await update_channel_name(FNG_CHANNEL_ID, fng_str)
-                last_fng = fng_str
-
-@tasks.loop(minutes=5)
-async def update_binance_volume():
-    global last_binance_volume
-    logging.info("🔄 Обновляю объёмы Binance...")
-    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(url, session)
-        if data:
-            volume = float(data.get("quoteVolume", 0))
-            vol_str = f"Binance Vol: {volume:,.0f}"
-            if vol_str != last_binance_volume:
-                await update_channel_name(BINANCE_VOLUME_CHANNEL_ID, vol_str)
-                last_binance_volume = vol_str
-
-@tasks.loop(minutes=5)
-async def update_coinbase_volume():
-    global last_coinbase_volume
-    logging.info("🔄 Обновляю объёмы Coinbase...")
-    url = "https://api.pro.coinbase.com/products/BTC-USD/stats"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(url, session)
-        if data:
-            volume = float(data.get("volume", 0))
-            vol_str = f"Coinbase Vol: {volume:,.0f}"
-            if vol_str != last_coinbase_volume:
-                await update_channel_name(COINBASE_VOLUME_CHANNEL_ID, vol_str)
-                last_coinbase_volume = vol_str
+    url = "https://api.alternative.me/fng/"
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await fetch_json(session, url)
+            fng_value = int(data["data"][0]["value"])
+            if last_fng != fng_value:
+                channel = client.get_channel(FNG_CHANNEL_ID)
+                if channel:
+                    await channel.edit(name=f"Fear & Greed: {fng_value}")
+                    logging.info(f"Обновлено имя канала Fear & Greed: {fng_value}")
+                last_fng = fng_value
+    except Exception as e:
+        logging.warning(f"Ошибка при обновлении индекса страха и жадности: {e}")
 
 @client.event
 async def on_ready():
     logging.info(f"✅ Бот запущен как {client.user}")
-    update_prices.start()
-    update_fng.start()
-    update_binance_volume.start()
-    update_coinbase_volume.start()
+    update_prices_and_volumes.start()
+    update_fear_and_greed.start()
 
-client.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    client.run(TOKEN)
