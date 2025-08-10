@@ -116,46 +116,55 @@ async def update_channel_if_changed(channel_id, new_name, key):
             except discord.HTTPException as e:
                 logger.error(f"Ошибка обновления канала {channel_id}: {e}")
 
-# ===== Time zone and sessions =====
+# ===== Forex Sessions =====
 MIAMI_TZ = pytz.timezone("America/New_York")
 
 SESSIONS = {
-    "Tokyo": {"open_hour": 17, "open_weekday": 6},   # Вс 17:00 Майами
-    "London": {"open_hour": 3, "open_weekday": 0},   # Пн 03:00 Майами
-    "New York": {"open_hour": 8, "open_weekday": 0}, # Пн 08:00 Майами
+    "Tokyo":    {"open_weekday": 6, "open_hour": 17},  # Вс 17:00 Майами
+    "London":   {"open_weekday": 0, "open_hour": 3},   # Пн 03:00 Майами
+    "New York": {"open_weekday": 0, "open_hour": 8},   # Пн 08:00 Майами
 }
 
-def get_session_times(now, market):
-    """Возвращает время открытия и закрытия последней/текущей/следующей сессии"""
-    open_weekday = SESSIONS[market]["open_weekday"]
-    open_hour = SESSIONS[market]["open_hour"]
+def get_session_schedule(now_miami, market):
+    """Возвращает open_time, close_time для текущей или следующей сессии"""
+    cfg = SESSIONS[market]
+    open_weekday, open_hour = cfg["open_weekday"], cfg["open_hour"]
 
-    # Определяем дату последнего открытия
-    days_since_open = (now.weekday() - open_weekday) % 7
-    last_open = now - timedelta(days=days_since_open)
-    last_open = last_open.replace(hour=open_hour, minute=0, second=0, microsecond=0)
+    # Рассчитываем открытие
+    open_time = now_miami.replace(hour=open_hour, minute=0, second=0, microsecond=0)
+    days_ahead = (open_weekday - now_miami.weekday()) % 7
+    open_time += timedelta(days=days_ahead)
 
-    # Если текущее время до открытия сегодня — смещаем на прошлую неделю
-    if now < last_open:
-        last_open -= timedelta(days=7)
+    # Если открытие уже прошло — переносим на следующую неделю
+    if now_miami >= open_time + timedelta(hours=24):
+        open_time += timedelta(days=7)
 
-    close_time = last_open + timedelta(hours=24)
-    return last_open, close_time
+    close_time = open_time + timedelta(hours=24)
+
+    # Если сейчас до открытия, то open_time корректен
+    # Если сейчас уже в сессии, то open_time = прошлое открытие
+    if open_time <= now_miami < close_time:
+        # Сессия уже открыта, open_time = начало текущей
+        pass
+    else:
+        # Сессия ещё закрыта, корректируем open_time на ближайшее
+        if now_miami < open_time:
+            close_time = open_time + timedelta(hours=24)
+
+    return open_time, close_time
 
 def get_sessions_status(now_utc):
     now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
-
     result = {}
     for market in SESSIONS:
-        open_time, close_time = get_session_times(now_miami, market)
+        open_time, close_time = get_session_schedule(now_miami, market)
 
         if open_time <= now_miami < close_time:
             status = "open"
             delta = close_time - now_miami
         else:
             status = "closed"
-            next_open = open_time + timedelta(days=7)
-            delta = next_open - now_miami
+            delta = open_time - now_miami
 
         result[market] = {
             "status": status,
@@ -181,9 +190,7 @@ def get_session_status_emoji(status, relative_seconds):
     if status == "open":
         return "🟢"
     elif status == "closed":
-        if relative_seconds <= 3600:
-            return "🟡"
-        return "🔴"
+        return "🟡" if relative_seconds <= 3600 else "🔴"
     return ""
 
 def format_updated_since(last_update_dt, now_dt):
@@ -203,7 +210,6 @@ def format_updated_since(last_update_dt, now_dt):
 async def update_sessions_message():
     now_utc = datetime.now(timezone.utc)
     sessions_info = get_sessions_status(now_utc)
-
     updated_text = format_updated_since(last_values.get("sessions_last_update"), now_utc)
     header = f"🕒 Форекс сессии — {updated_text}\n\n"
 
@@ -211,13 +217,12 @@ async def update_sessions_message():
     for market, info in sessions_info.items():
         emoji = get_session_status_emoji(info["status"], info["relative_seconds"])
         if info["status"] == "closed":
-            line = f"{emoji} {market}: closed — opens in {info['formatted_delta']}"
+            line = f"{emoji} {market}: закрыта — откроется через {info['formatted_delta']}"
         else:
-            line = f"{emoji} {market}: open — closes in {info['formatted_delta']}"
+            line = f"{emoji} {market}: открыта — закроется через {info['formatted_delta']}"
         lines.append(line)
 
-    footer = "\n\n "
-    content = header + "\n".join(lines) + footer
+    content = header + "\n".join(lines) + "\n\n"
 
     channel = bot.get_channel(SESSIONS_CHANNEL_ID)
     if not channel:
