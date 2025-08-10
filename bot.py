@@ -270,7 +270,7 @@ async def update_fng():
         if fng is not None:
             await update_channel_if_changed(FNG_CHANNEL_ID, f"Fear & Greed: {fng}", "fng")
 
-@tasks.loop(minutes=17)
+@tasks.loop(minutes=5)
 async def health_ping():
     if not HEALTH_URL:
         return
