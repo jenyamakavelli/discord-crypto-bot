@@ -120,36 +120,92 @@ async def update_channel_if_changed(channel_id, new_name, key):
 MIAMI_TZ = pytz.timezone("America/New_York")
 
 SESSIONS = {
-    "Pacific": {"open_hour": 17, "close_hour": 2, "open_weekday": 6, "currencies": ["AUD🇦🇺", "NZD🇳🇿"], "emoji": "🌊"},  # Sunday 17:00 ET - Monday 2:00 ET
-    "Tokyo": {"open_hour": 19, "close_hour": 4, "open_weekday": 6, "currencies": ["JPY🇯🇵", "CNY🇨🇳", "SGD🇸🇬", "HKD🇭🇰"], "emoji": "🏯"},  # Sunday 19:00 ET - Monday 4:00 ET
-    "European": {"open_hour": 3, "close_hour": 12, "open_weekday": 0, "currencies": ["EUR🇪🇺", "GBP🇬🇧", "CHF🇨🇭"], "emoji": "🇪🇺"},  # Monday 3:00 ET - Monday 12:00 ET
-    "American": {"open_hour": 8, "close_hour": 17, "open_weekday": 0, "currencies": ["USD🇺🇸"], "emoji": "🇺🇸"},  # Monday 8:00 ET - Monday 17:00 ET
+    "Pacific": {
+        "open_hour": 17,  # 17:00 ET (Майами) — открытие
+        "close_hour": 2,  # 02:00 ET (следующего дня) — закрытие
+        "open_weekday": None,  # Работает каждый день
+        "currencies": ["AUD", "NZD"],
+        "emoji": "🌊",
+    },
+    "Tokyo": {
+        "open_hour": 19,
+        "close_hour": 4,
+        "open_weekday": None,
+        "currencies": ["JPY", "CNY", "SGD", "HKD"],
+        "emoji": "🏯",
+    },
+    "European": {
+        "open_hour": 3,
+        "close_hour": 12,
+        "open_weekday": 0,  # понедельник
+        "currencies": ["EUR", "GBP", "CHF"],
+        "emoji": "🇪🇺",
+    },
+    "American": {
+        "open_hour": 8,
+        "close_hour": 17,
+        "open_weekday": 0,
+        "currencies": ["USD"],
+        "emoji": "🇺🇸",
+    },
 }
 
-def get_session_times(now, market):
-    """Возвращает время открытия и закрытия последней или текущей сессии в Miami (ET)"""
-    info = SESSIONS[market]
-    open_hour = info["open_hour"]
-    close_hour = info["close_hour"]
-    open_weekday = info["open_weekday"]
+def normalize_time(dt):
+    # Убирает секунды и микросекунды, чтобы не сбивало отображение
+    return dt.replace(second=0, microsecond=0)
 
-    # Определяем дату последнего открытия (день недели + час)
-    days_since_open = (now.weekday() - open_weekday) % 7
-    last_open = now - timedelta(days=days_since_open)
-    last_open = last_open.replace(hour=open_hour, minute=0, second=0, microsecond=0)
+def get_session_open_close(now, session_name):
+    """
+    Возвращает время открытия и закрытия сессии для текущего дня или ближайшего,
+    учитывая, что некоторые сессии могут закрываться в следующий день (close_hour < open_hour).
+    Для сессий без конкретного дня (Pacific, Tokyo) — каждый день активны.
+    """
+    session = SESSIONS[session_name]
+    now = now.astimezone(MIAMI_TZ)
+    now = normalize_time(now)
 
-    # Если текущее время до открытия сегодня — смещаем на прошлую неделю
-    if now < last_open:
-        last_open -= timedelta(days=7)
-
-    # Обработка перехода закрытия на следующий день
-    if close_hour > open_hour:
-        close_time = last_open.replace(hour=close_hour)
+    # Если задан день недели для открытия — нужно учитывать переход недели
+    if session["open_weekday"] is not None:
+        # Определяем дату открытия текущей недели (понедельник)
+        weekday = now.weekday()
+        days_to_open = (session["open_weekday"] - weekday) % 7
+        open_date = (now + timedelta(days=days_to_open)).replace(
+            hour=session["open_hour"], minute=0, second=0, microsecond=0
+        )
     else:
-        # Закрытие на следующий день
-        close_time = last_open.replace(hour=close_hour) + timedelta(days=1)
+        # Для сессий без дня — открытие сегодня в open_hour, либо вчера, если open_hour > close_hour и текущее время до открытия
+        open_date = now.replace(hour=session["open_hour"], minute=0)
+        if open_date > now and session["open_hour"] > session["close_hour"]:
+            # Значит мы в период между закрытием и открытием, открытие было вчера
+            open_date -= timedelta(days=1)
 
-    return last_open, close_time
+    # Закрытие — если close_hour < open_hour, значит закрытие на следующий день
+    close_date = open_date.replace(hour=session["close_hour"], minute=0)
+    if session["close_hour"] <= session["open_hour"]:
+        close_date += timedelta(days=1)
+
+    return open_date, close_date
+
+def get_session_status(now, session_name):
+    now = now.astimezone(MIAMI_TZ)
+    open_time, close_time = get_session_open_close(now, session_name)
+
+    if open_time <= now < close_time:
+        status = "open"
+        delta = close_time - now
+    else:
+        status = "closed"
+        # Для закрытой сессии ищем ближайшее открытие — для дневных сессий это может быть на следующий день или понедельник+7 для weekly
+        open_time_next = open_time
+        if now >= close_time:
+            # Уже после закрытия, сдвигаем открытие на следующий день или неделю
+            if SESSIONS[session_name]["open_weekday"] is not None:
+                open_time_next = open_time + timedelta(days=7)
+            else:
+                open_time_next = open_time + timedelta(days=1)
+        delta = open_time_next - now
+
+    return status, delta
 
 def format_timedelta(delta):
     total_seconds = int(delta.total_seconds())
@@ -163,15 +219,6 @@ def format_timedelta(delta):
         parts.append(f"{hours}h")
     parts.append(f"{minutes}m")
     return " ".join(parts)
-
-def get_session_status_emoji(status, relative_seconds):
-    if status == "open":
-        return "🟢"
-    elif status == "closed":
-        if relative_seconds <= 3600:
-            return "🟡"
-        return "🔴"
-    return ""
 
 def format_updated_since(last_update_dt, now_dt):
     if last_update_dt is None:
@@ -187,76 +234,50 @@ def format_updated_since(last_update_dt, now_dt):
         hours = int(seconds // 3600)
         return f"обновлено {hours} ч назад"
 
-def progress_bar(start, end, now, length=10):
-    total = (end - start).total_seconds()
-    elapsed = (now - start).total_seconds()
-    fraction = max(0, min(1, elapsed / total))
-    filled_len = int(length * fraction)
-    bar = "█" * filled_len + "-" * (length - filled_len)
-    percent = int(fraction * 100)
-    return f"[{bar}] {percent}%"
+def get_session_status_emoji(status):
+    if status == "open":
+        return "🟢"
+    elif status == "closed":
+        return "🔴"
+    return ""
 
-def get_sessions_status(now_utc):
-    now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
-
-    result = {}
-    for market in SESSIONS:
-        open_time, close_time = get_session_times(now_miami, market)
-
-        if open_time <= now_miami < close_time:
-            status = "open"
-            delta = close_time - now_miami
-        else:
-            status = "closed"
-            # Следующее открытие
-            next_open = open_time + timedelta(days=7)
-            delta = next_open - now_miami
-
-        result[market] = {
-            "status": status,
-            "relative_seconds": int(delta.total_seconds()),
-            "formatted_delta": format_timedelta(delta),
-            "open_time": open_time,
-            "close_time": close_time,
-            "currencies": SESSIONS[market]["currencies"],
-            "emoji": SESSIONS[market]["emoji"],
-        }
-    return result
-
-def get_current_sessions_overlap(sessions_info):
-    """Возвращает список сессий, которые сейчас открыты"""
-    open_sessions = [name for name, info in sessions_info.items() if info["status"] == "open"]
-    return open_sessions
+def format_currency_list(curr_list):
+    # Добавляем эмодзи стран по ISO 3166-1 alpha-2 (часть валют совпадает с кодами стран)
+    emoji_map = {
+        "AUD": "🇦🇺",
+        "NZD": "🇳🇿",
+        "JPY": "🇯🇵",
+        "CNY": "🇨🇳",
+        "SGD": "🇸🇬",
+        "HKD": "🇭🇰",
+        "EUR": "🇪🇺",
+        "GBP": "🇬🇧",
+        "CHF": "🇨🇭",
+        "USD": "🇺🇸",
+    }
+    parts = []
+    for c in curr_list:
+        parts.append(f"{c}{emoji_map.get(c, '')}")
+    return ", ".join(parts)
 
 async def update_sessions_message():
     now_utc = datetime.now(timezone.utc)
-    sessions_info = get_sessions_status(now_utc)
-
+    now_miami = now_utc.astimezone(MIAMI_TZ)
     updated_text = format_updated_since(last_values.get("sessions_last_update"), now_utc)
-    header = f"🕒 Форекс сессии — {updated_text}\n\n"
 
     lines = []
-    for market, info in sessions_info.items():
-        emoji = get_session_status_emoji(info["status"], info["relative_seconds"])
-        status_text = ""
-        if info["status"] == "open":
-            bar = progress_bar(info["open_time"], info["close_time"], now_utc.astimezone(MIAMI_TZ))
-            status_text = f"открыта — {bar} — закроется через {info['formatted_delta']}"
-        else:
-            status_text = f"закрыта — откроется через {info['formatted_delta']}"
+    for session_name, session_info in SESSIONS.items():
+        status, delta = get_session_status(now_utc, session_name)
+        emoji = get_session_status_emoji(status)
+        delta_str = format_timedelta(delta)
+        curr_str = format_currency_list(session_info["currencies"])
+        status_str = "откр." if status == "open" else "закр."
+        verb_str = "закроется" if status == "open" else "откроется"
+        lines.append(
+            f"{emoji}  {session_name}:  {status_str} — {verb_str} через  {delta_str}  [{curr_str}]"
+        )
 
-        currencies_str = ", ".join(info["currencies"])
-        line = f"{emoji} {info['emoji']} {market}: {status_text} [{currencies_str}]"
-        lines.append(line)
-
-    # Добавим пустую строку между сессиями для визуального разделения
-    content = header + "\n\n".join(lines) + "\n\n"
-
-    # Отобразим пересечения открытых сессий, если есть более одной
-    open_sessions = get_current_sessions_overlap(sessions_info)
-    if len(open_sessions) > 1:
-        overlap_emojis = " + ".join([f"{sessions_info[s]['emoji']} {s}" for s in open_sessions])
-        content += f"📌 Пересечения сейчас: {overlap_emojis}\n"
+    content = f"🕒 Форекс сессии — {updated_text}\n\n" + "\n".join(lines)
 
     channel = bot.get_channel(SESSIONS_CHANNEL_ID)
     if not channel:
