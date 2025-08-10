@@ -121,9 +121,9 @@ MIAMI_TZ = pytz.timezone("America/New_York")
 
 SESSIONS = {
     "Pacific": {
-        "open_hour": 17,  # 17:00 ET (Майами) — открытие
-        "close_hour": 2,  # 02:00 ET (следующего дня) — закрытие
-        "open_weekday": None,  # Работает каждый день
+        "open_hour": 17,
+        "close_hour": 2,
+        "open_weekday": None,
         "currencies": ["AUD", "NZD"],
         "emoji": "🌊",
     },
@@ -137,7 +137,7 @@ SESSIONS = {
     "European": {
         "open_hour": 3,
         "close_hour": 12,
-        "open_weekday": 0,  # понедельник
+        "open_weekday": 0,
         "currencies": ["EUR", "GBP", "CHF"],
         "emoji": "🇪🇺",
     },
@@ -151,35 +151,24 @@ SESSIONS = {
 }
 
 def normalize_time(dt):
-    # Убирает секунды и микросекунды, чтобы не сбивало отображение
     return dt.replace(second=0, microsecond=0)
 
 def get_session_open_close(now, session_name):
-    """
-    Возвращает время открытия и закрытия сессии для текущего дня или ближайшего,
-    учитывая, что некоторые сессии могут закрываться в следующий день (close_hour < open_hour).
-    Для сессий без конкретного дня (Pacific, Tokyo) — каждый день активны.
-    """
     session = SESSIONS[session_name]
     now = now.astimezone(MIAMI_TZ)
     now = normalize_time(now)
 
-    # Если задан день недели для открытия — нужно учитывать переход недели
     if session["open_weekday"] is not None:
-        # Определяем дату открытия текущей недели (понедельник)
         weekday = now.weekday()
         days_to_open = (session["open_weekday"] - weekday) % 7
         open_date = (now + timedelta(days=days_to_open)).replace(
             hour=session["open_hour"], minute=0, second=0, microsecond=0
         )
     else:
-        # Для сессий без дня — открытие сегодня в open_hour, либо вчера, если open_hour > close_hour и текущее время до открытия
         open_date = now.replace(hour=session["open_hour"], minute=0)
         if open_date > now and session["open_hour"] > session["close_hour"]:
-            # Значит мы в период между закрытием и открытием, открытие было вчера
             open_date -= timedelta(days=1)
 
-    # Закрытие — если close_hour < open_hour, значит закрытие на следующий день
     close_date = open_date.replace(hour=session["close_hour"], minute=0)
     if session["close_hour"] <= session["open_hour"]:
         close_date += timedelta(days=1)
@@ -195,10 +184,8 @@ def get_session_status(now, session_name):
         delta = close_time - now
     else:
         status = "closed"
-        # Для закрытой сессии ищем ближайшее открытие — для дневных сессий это может быть на следующий день или понедельник+7 для weekly
         open_time_next = open_time
         if now >= close_time:
-            # Уже после закрытия, сдвигаем открытие на следующий день или неделю
             if SESSIONS[session_name]["open_weekday"] is not None:
                 open_time_next = open_time + timedelta(days=7)
             else:
@@ -242,27 +229,10 @@ def get_session_status_emoji(status):
     return ""
 
 def format_currency_list(curr_list):
-    # Добавляем эмодзи стран по ISO 3166-1 alpha-2 (часть валют совпадает с кодами стран)
-    emoji_map = {
-        "AUD": "🇦🇺",
-        "NZD": "🇳🇿",
-        "JPY": "🇯🇵",
-        "CNY": "🇨🇳",
-        "SGD": "🇸🇬",
-        "HKD": "🇭🇰",
-        "EUR": "🇪🇺",
-        "GBP": "🇬🇧",
-        "CHF": "🇨🇭",
-        "USD": "🇺🇸",
-    }
-    parts = []
-    for c in curr_list:
-        parts.append(f"{c}{emoji_map.get(c, '')}")
-    return ", ".join(parts)
+    return ", ".join(curr_list)
 
 async def update_sessions_message():
     now_utc = datetime.now(timezone.utc)
-    now_miami = now_utc.astimezone(MIAMI_TZ)
     updated_text = format_updated_since(last_values.get("sessions_last_update"), now_utc)
 
     lines = []
