@@ -120,48 +120,47 @@ async def update_channel_if_changed(channel_id, new_name, key):
 MIAMI_TZ = pytz.timezone("America/New_York")
 
 SESSIONS = {
-    "Tokyo": {"open_hour": 17, "open_weekday": 6},   # Вс 17:00
-    "London": {"open_hour": 3, "open_weekday": 0},   # Пн 03:00
-    "New York": {"open_hour": 8, "open_weekday": 0}, # Пн 08:00
+    "Tokyo": {"open_hour": 17, "open_weekday": 6},   # Вс 17:00 Майами
+    "London": {"open_hour": 3, "open_weekday": 0},   # Пн 03:00 Майами
+    "New York": {"open_hour": 8, "open_weekday": 0}, # Пн 08:00 Майами
 }
 
-def get_next_session_open(now, market):
+def get_session_times(now, market):
+    """Возвращает время открытия и закрытия последней/текущей/следующей сессии"""
     open_weekday = SESSIONS[market]["open_weekday"]
     open_hour = SESSIONS[market]["open_hour"]
 
-    days_ahead = (open_weekday - now.weekday()) % 7
-    open_time = now.replace(hour=open_hour, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
-    if open_time <= now:
-        open_time += timedelta(days=7)
-    return open_time
+    # Определяем дату последнего открытия
+    days_since_open = (now.weekday() - open_weekday) % 7
+    last_open = now - timedelta(days=days_since_open)
+    last_open = last_open.replace(hour=open_hour, minute=0, second=0, microsecond=0)
 
-def get_next_session_close(open_time):
-    return open_time + timedelta(hours=24)
+    # Если текущее время до открытия сегодня — смещаем на прошлую неделю
+    if now < last_open:
+        last_open -= timedelta(days=7)
+
+    close_time = last_open + timedelta(hours=24)
+    return last_open, close_time
 
 def get_sessions_status(now_utc):
     now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
 
     result = {}
     for market in SESSIONS:
-        next_open = get_next_session_open(now_miami, market)
-        next_close = get_next_session_close(next_open)
+        open_time, close_time = get_session_times(now_miami, market)
 
-        if next_open <= now_miami < next_close:
+        if open_time <= now_miami < close_time:
             status = "open"
-            delta = next_close - now_miami
+            delta = close_time - now_miami
         else:
             status = "closed"
-            if now_miami >= next_close:
-                next_open += timedelta(days=7)
+            next_open = open_time + timedelta(days=7)
             delta = next_open - now_miami
-
-        relative_seconds = int(delta.total_seconds())
-        formatted_delta = format_timedelta(delta)
 
         result[market] = {
             "status": status,
-            "relative_seconds": relative_seconds,
-            "formatted_delta": formatted_delta,
+            "relative_seconds": int(delta.total_seconds()),
+            "formatted_delta": format_timedelta(delta),
         }
     return result
 
