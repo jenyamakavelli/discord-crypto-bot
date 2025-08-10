@@ -116,68 +116,104 @@ async def update_channel_if_changed(channel_id, new_name, key):
             except discord.HTTPException as e:
                 logger.error(f"Ошибка обновления канала {channel_id}: {e}")
 
-# ===== Forex Sessions =====
+# ===== Time zone and sessions (corrected) =====
 MIAMI_TZ = pytz.timezone("America/New_York")
 
+# Реальные интервалы (время — в майамском поясе)
+# Tokyo: Sun 17:00 (Miami) — Mon 02:00 (Miami)
+# London: Mon 03:00 (Miami) — Mon 12:00 (Miami)
+# New York: Mon 08:00 (Miami) — Mon 17:00 (Miami)
 SESSIONS = {
-    "Tokyo":    {"open_weekday": 6, "open_hour": 17},  # Вс 17:00 Майами
-    "London":   {"open_weekday": 0, "open_hour": 3},   # Пн 03:00 Майами
-    "New York": {"open_weekday": 0, "open_hour": 8},   # Пн 08:00 Майами
+    "Tokyo":    {"open_weekday": 6, "open_hour": 17, "close_weekday": 0, "close_hour": 2},
+    "London":   {"open_weekday": 0, "open_hour": 3,  "close_weekday": 0, "close_hour": 12},
+    "New York": {"open_weekday": 0, "open_hour": 8,  "close_weekday": 0, "close_hour": 17},
 }
 
-def get_session_schedule(now_miami, market):
-    """Возвращает open_time, close_time для текущей или следующей сессии"""
+def _build_dt(base_dt, hour):
+    """Helper: replace hour/min/sec preserving tzinfo"""
+    return base_dt.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+def compute_candidate_open_close(now_miami, market):
+    """
+    Возвращает кортеж (candidate_open, candidate_close) для ближайшего открытия этой недели (может быть в прошлом/будущем).
+    """
     cfg = SESSIONS[market]
-    open_weekday, open_hour = cfg["open_weekday"], cfg["open_hour"]
+    open_w, open_h = cfg["open_weekday"], cfg["open_hour"]
+    close_w, close_h = cfg["close_weekday"], cfg["close_hour"]
 
-    # Рассчитываем открытие
-    open_time = now_miami.replace(hour=open_hour, minute=0, second=0, microsecond=0)
-    days_ahead = (open_weekday - now_miami.weekday()) % 7
-    open_time += timedelta(days=days_ahead)
+    # candidate open (this week's occurrence)
+    days_to_candidate = (open_w - now_miami.weekday()) % 7
+    candidate_open = (now_miami + timedelta(days=days_to_candidate)).replace(hour=open_h, minute=0, second=0, microsecond=0)
 
-    # Если открытие уже прошло — переносим на следующую неделю
-    if now_miami >= open_time + timedelta(hours=24):
-        open_time += timedelta(days=7)
+    # candidate close relative to candidate_open
+    days_from_open_to_close = (close_w - candidate_open.weekday()) % 7
+    candidate_close = candidate_open.replace(hour=close_h, minute=0, second=0, microsecond=0) + timedelta(days=days_from_open_to_close)
 
-    close_time = open_time + timedelta(hours=24)
+    # Safety: ensure close is after open (if config is weird)
+    if candidate_close <= candidate_open:
+        candidate_close += timedelta(days=1)
 
-    # Если сейчас до открытия, то open_time корректен
-    # Если сейчас уже в сессии, то open_time = прошлое открытие
-    if open_time <= now_miami < close_time:
-        # Сессия уже открыта, open_time = начало текущей
-        pass
-    else:
-        # Сессия ещё закрыта, корректируем open_time на ближайшее
-        if now_miami < open_time:
-            close_time = open_time + timedelta(hours=24)
+    return candidate_open, candidate_close
 
-    return open_time, close_time
-
-def get_sessions_status(now_utc):
+def get_session_state(now_utc):
+    """
+    Возвращает dict: { market: { status, relative_seconds, formatted_delta, next_open, open_time, close_time } }
+    """
     now_miami = now_utc.astimezone(MIAMI_TZ).replace(second=0, microsecond=0)
-    result = {}
-    for market in SESSIONS:
-        open_time, close_time = get_session_schedule(now_miami, market)
+    out = {}
 
-        if open_time <= now_miami < close_time:
+    for market in SESSIONS.keys():
+        candidate_open, candidate_close = compute_candidate_open_close(now_miami, market)
+        prev_open = candidate_open - timedelta(days=7)
+        # compute prev_close from prev_open
+        cfg = SESSIONS[market]
+        close_w, close_h = cfg["close_weekday"], cfg["close_hour"]
+        days_from_prev_open_to_close = (close_w - prev_open.weekday()) % 7
+        prev_close = prev_open.replace(hour=close_h, minute=0, second=0, microsecond=0) + timedelta(days=days_from_prev_open_to_close)
+        if prev_close <= prev_open:
+            prev_close += timedelta(days=1)
+
+        # Case 1: we're inside previous occurrence (this handles e.g. Mon 01:30 for Tokyo)
+        if prev_open <= now_miami < prev_close:
             status = "open"
-            delta = close_time - now_miami
+            delta = prev_close - now_miami
+            open_time = prev_open
+            close_time = prev_close
+            next_open = candidate_open  # next occurrence is candidate_open
+        # Case 2: we're inside candidate occurrence (rare when candidate_open is same-week and in past)
+        elif candidate_open <= now_miami < candidate_close:
+            status = "open"
+            delta = candidate_close - now_miami
+            open_time = candidate_open
+            close_time = candidate_close
+            next_open = candidate_open + timedelta(days=7)
         else:
+            # closed: find nearest future open
+            if now_miami < candidate_open:
+                next_open = candidate_open
+            else:
+                next_open = candidate_open + timedelta(days=7)
             status = "closed"
-            delta = open_time - now_miami
+            delta = next_open - now_miami
+            open_time = None
+            close_time = None
 
-        result[market] = {
+        out[market] = {
             "status": status,
             "relative_seconds": int(delta.total_seconds()),
             "formatted_delta": format_timedelta(delta),
+            "next_open": next_open,
+            "open_time": open_time,
+            "close_time": close_time,
         }
-    return result
+
+    return out
 
 def format_timedelta(delta):
     total_seconds = int(delta.total_seconds())
-    days, remainder = divmod(total_seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
     parts = []
     if days > 0:
         parts.append(f"{days}d")
@@ -209,17 +245,24 @@ def format_updated_since(last_update_dt, now_dt):
 
 async def update_sessions_message():
     now_utc = datetime.now(timezone.utc)
-    sessions_info = get_sessions_status(now_utc)
+    sessions = get_session_state(now_utc)
+
+    # Сортировка: открытые вверх, затем по времени до события (меньше первым)
+    sorted_items = sorted(
+        sessions.items(),
+        key=lambda kv: (0 if kv[1]["status"] == "open" else 1, kv[1]["relative_seconds"])
+    )
+
     updated_text = format_updated_since(last_values.get("sessions_last_update"), now_utc)
     header = f"🕒 Форекс сессии — {updated_text}\n\n"
 
     lines = []
-    for market, info in sessions_info.items():
+    for market, info in sorted_items:
         emoji = get_session_status_emoji(info["status"], info["relative_seconds"])
-        if info["status"] == "closed":
-            line = f"{emoji} {market}: закрыта — откроется через {info['formatted_delta']}"
-        else:
+        if info["status"] == "open":
             line = f"{emoji} {market}: открыта — закроется через {info['formatted_delta']}"
+        else:
+            line = f"{emoji} {market}: закрыта — откроется через {info['formatted_delta']}"
         lines.append(line)
 
     content = header + "\n".join(lines) + "\n\n"
