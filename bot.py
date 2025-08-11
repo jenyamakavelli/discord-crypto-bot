@@ -62,17 +62,17 @@ def format_timedelta(delta):
 
 def format_updated_since(last_update_dt, now_dt):
     if last_update_dt is None:
-        return "обновлено только что"
+        return "только что"
     diff = now_dt - last_update_dt
     seconds = diff.total_seconds()
     if seconds < 60:
-        return "обновлено только что"
+        return "только что"
     elif seconds < 3600:
         mins = int(seconds // 60)
-        return f"обновлено {mins} мин назад"
+        return f"{mins} мин назад"
     else:
         hours = int(seconds // 3600)
-        return f"обновлено {hours} ч назад"
+        return f"{hours} ч назад"
 
 def get_session_status_emoji(status, relative_seconds):
     if status == "open":
