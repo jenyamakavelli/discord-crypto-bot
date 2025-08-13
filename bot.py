@@ -11,7 +11,7 @@ import pytz
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("forex-bot")
+logger = logging.getLogger("forex-sessions")
 
 # =============== CONFIG ===============
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -46,14 +46,6 @@ last_values = {
     "sessions_last_update": None,
 }
 
-last_price_messages = {
-    "btc_price": None,
-    "eth_price": None,
-    "fng": None,
-    "btc_vol": None,
-    "eth_vol": None,
-}
-
 # ===== Helpers =====
 def format_timedelta(delta: timedelta) -> str:
     total_seconds = int(delta.total_seconds())
@@ -78,10 +70,10 @@ def format_updated_since(last_update_dt, now_dt):
     if seconds < 60:
         return "только что"
     elif seconds < 3600:
-        mins = seconds // 60
+        mins = int(seconds // 60)
         return f"{mins} мин назад"
     else:
-        hours = seconds // 3600
+        hours = int(seconds // 3600)
         return f"{hours} ч назад"
 
 def get_session_status_emoji(status, relative_seconds):
@@ -97,7 +89,7 @@ def get_session_status_emoji(status, relative_seconds):
 MIAMI_TZ = pytz.timezone("America/New_York")
 EUROPE_TZ = pytz.timezone("Europe/Berlin")
 
-# ===== Session definitions =====
+# ===== Session definitions (open time in ET) =====
 SESSION_DEFS = {
     "Pacific": {"open_hour": 17, "open_minute": 0, "duration_hours": 9.0, "symbols": ["AUD", "NZD"]},
     "Tokyo": {"open_hour": 19, "open_minute": 0, "duration_hours": 9.0, "symbols": ["JPY", "CNY", "SGD", "HKD"]},
@@ -166,7 +158,7 @@ async def update_sessions_message():
     content = header + "\n".join(lines) + "\n\n" + "\n".join(footer_lines)
     channel = bot.get_channel(SESSIONS_CHANNEL_ID)
     if not channel:
-        logger.error("Sessions channel not found (SESSIONS_CHANNEL_ID=%s)", SESSIONS_CHANNEL_ID)
+        logger.error(f"Sessions channel not found (SESSIONS_CHANNEL_ID={SESSIONS_CHANNEL_ID})")
         return
     now_for_store = now_utc
     if last_values.get("sessions_msg_id"):
@@ -178,7 +170,7 @@ async def update_sessions_message():
                 last_values["sessions_last_update"] = now_for_store
                 logger.info("Updated sessions message")
         except (discord.NotFound, discord.Forbidden) as e:
-            logger.warning("Previous sessions message not found or forbidden, creating new one: %s", e)
+            logger.warning(f"Previous sessions message not found or forbidden, creating new one: {e}")
             msg = await channel.send(content)
             last_values["sessions_msg_id"] = msg.id
             last_values["sessions_msg_content"] = content
@@ -191,207 +183,15 @@ async def update_sessions_message():
         last_values["sessions_last_update"] = now_for_store
         logger.info("Created sessions message")
 
-async def fetch_json(url):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=15) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-
-async def update_btc_price():
-    if BTC_PRICE_CHANNEL_ID == 0:
-        return
-    try:
-        data = await fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
-        price = data.get("bitcoin", {}).get("usd")
-        if price is None:
-            logger.warning("BTC price not found in API response")
-            return
-        content = f"💰 BTC цена: ${price:,.2f} USD"
-        channel = bot.get_channel(BTC_PRICE_CHANNEL_ID)
-        if not channel:
-            logger.error("BTC price channel not found")
-            return
-        last_msg_id = last_price_messages["btc_price"]
-        if last_msg_id:
-            try:
-                msg = await channel.fetch_message(last_msg_id)
-                if msg.content != content:
-                    await msg.edit(content=content)
-                    logger.info("BTC price message updated")
-            except (discord.NotFound, discord.Forbidden):
-                msg = await channel.send(content)
-                last_price_messages["btc_price"] = msg.id
-                logger.info("BTC price message created")
-        else:
-            msg = await channel.send(content)
-            last_price_messages["btc_price"] = msg.id
-            logger.info("BTC price message created")
-    except Exception as e:
-        logger.error(f"Error updating BTC price: {e}")
-
-async def update_eth_price():
-    if ETH_PRICE_CHANNEL_ID == 0:
-        return
-    try:
-        data = await fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
-        price = data.get("ethereum", {}).get("usd")
-        if price is None:
-            logger.warning("ETH price not found in API response")
-            return
-        content = f"💰 ETH цена: ${price:,.2f} USD"
-        channel = bot.get_channel(ETH_PRICE_CHANNEL_ID)
-        if not channel:
-            logger.error("ETH price channel not found")
-            return
-        last_msg_id = last_price_messages["eth_price"]
-        if last_msg_id:
-            try:
-                msg = await channel.fetch_message(last_msg_id)
-                if msg.content != content:
-                    await msg.edit(content=content)
-                    logger.info("ETH price message updated")
-            except (discord.NotFound, discord.Forbidden):
-                msg = await channel.send(content)
-                last_price_messages["eth_price"] = msg.id
-                logger.info("ETH price message created")
-        else:
-            msg = await channel.send(content)
-            last_price_messages["eth_price"] = msg.id
-            logger.info("ETH price message created")
-    except Exception as e:
-        logger.error(f"Error updating ETH price: {e}")
-
-async def update_fng():
-    if FNG_CHANNEL_ID == 0:
-        return
-    try:
-        # Fear & Greed Index API — https://api.alternative.me/fng/?limit=1
-        data = await fetch_json("https://api.alternative.me/fng/?limit=1")
-        value = data.get("data", [{}])[0].get("value")
-        classification = data.get("data", [{}])[0].get("value_classification")
-        if value is None or classification is None:
-            logger.warning("FNG data missing")
-            return
-        content = f"📈 Fear & Greed Index: {value} ({classification})"
-        channel = bot.get_channel(FNG_CHANNEL_ID)
-        if not channel:
-            logger.error("FNG channel not found")
-            return
-        last_msg_id = last_price_messages["fng"]
-        if last_msg_id:
-            try:
-                msg = await channel.fetch_message(last_msg_id)
-                if msg.content != content:
-                    await msg.edit(content=content)
-                    logger.info("FNG message updated")
-            except (discord.NotFound, discord.Forbidden):
-                msg = await channel.send(content)
-                last_price_messages["fng"] = msg.id
-                logger.info("FNG message created")
-        else:
-            msg = await channel.send(content)
-            last_price_messages["fng"] = msg.id
-            logger.info("FNG message created")
-    except Exception as e:
-        logger.error(f"Error updating FNG: {e}")
-
-async def update_btc_vol():
-    if BTC_VOL_CHANNEL_ID == 0:
-        return
-    try:
-        data = await fetch_json("https://api.coingecko.com/api/v3/coins/bitcoin")
-        vol = data.get("market_data", {}).get("total_volume", {}).get("usd")
-        if vol is None:
-            logger.warning("BTC volume not found")
-            return
-        vol_formatted = f"${vol:,.0f}"
-        content = f"📊 BTC объем торгов (24ч): {vol_formatted}"
-        channel = bot.get_channel(BTC_VOL_CHANNEL_ID)
-        if not channel:
-            logger.error("BTC vol channel not found")
-            return
-        last_msg_id = last_price_messages["btc_vol"]
-        if last_msg_id:
-            try:
-                msg = await channel.fetch_message(last_msg_id)
-                if msg.content != content:
-                    await msg.edit(content=content)
-                    logger.info("BTC vol message updated")
-            except (discord.NotFound, discord.Forbidden):
-                msg = await channel.send(content)
-                last_price_messages["btc_vol"] = msg.id
-                logger.info("BTC vol message created")
-        else:
-            msg = await channel.send(content)
-            last_price_messages["btc_vol"] = msg.id
-            logger.info("BTC vol message created")
-    except Exception as e:
-        logger.error(f"Error updating BTC vol: {e}")
-
-async def update_eth_vol():
-    if ETH_VOL_CHANNEL_ID == 0:
-        return
-    try:
-        data = await fetch_json("https://api.coingecko.com/api/v3/coins/ethereum")
-        vol = data.get("market_data", {}).get("total_volume", {}).get("usd")
-        if vol is None:
-            logger.warning("ETH volume not found")
-            return
-        vol_formatted = f"${vol:,.0f}"
-        content = f"📊 ETH объем торгов (24ч): {vol_formatted}"
-        channel = bot.get_channel(ETH_VOL_CHANNEL_ID)
-        if not channel:
-            logger.error("ETH vol channel not found")
-            return
-        last_msg_id = last_price_messages["eth_vol"]
-        if last_msg_id:
-            try:
-                msg = await channel.fetch_message(last_msg_id)
-                if msg.content != content:
-                    await msg.edit(content=content)
-                    logger.info("ETH vol message updated")
-            except (discord.NotFound, discord.Forbidden):
-                msg = await channel.send(content)
-                last_price_messages["eth_vol"] = msg.id
-                logger.info("ETH vol message created")
-        else:
-            msg = await channel.send(content)
-            last_price_messages["eth_vol"] = msg.id
-            logger.info("ETH vol message created")
-    except Exception as e:
-        logger.error(f"Error updating ETH vol: {e}")
-
 # ===== Background tasks =====
 @tasks.loop(seconds=60)
 async def update_sessions():
     try:
         await update_sessions_message()
     except Exception as e:
-        logger.exception("Error in update_sessions task: %s", e)
+        logger.exception(f"Error in update_sessions task: {e}")
 
-@tasks.loop(minutes=6)
-async def update_btc_eth_prices_loop():
-    try:
-        await update_btc_price()
-        await update_eth_price()
-    except Exception as e:
-        logger.exception(f"Error in BTC/ETH price update: {e}")
-
-@tasks.loop(minutes=45)
-async def update_fng_loop():
-    try:
-        await update_fng()
-    except Exception as e:
-        logger.exception(f"Error in FNG update: {e}")
-
-@tasks.loop(minutes=30)
-async def update_volumes_loop():
-    try:
-        await update_btc_vol()
-        await update_eth_vol()
-    except Exception as e:
-        logger.exception(f"Error in volume update: {e}")
-
+# ===== Auto-ping Koyeb =====
 @tasks.loop(minutes=5)
 async def ping_health():
     if not HEALTH_URL:
@@ -399,24 +199,135 @@ async def ping_health():
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(HEALTH_URL, timeout=10) as resp:
-                logger.debug("Pinged health URL %s status=%s", HEALTH_URL, resp.status)
+                logger.debug(f"Pinged health URL {HEALTH_URL} status={resp.status}")
     except Exception as e:
-        logger.warning("Health ping failed: %s", e)
+        logger.warning(f"Health ping failed: {e}")
+
+# ===== Price & Indicators Update (CoinGecko API) =====
+
+async def fetch_json(session, url):
+    async with session.get(url, timeout=10) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+async def update_btc_price():
+    if BTC_PRICE_CHANNEL_ID == 0:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await fetch_json(session, "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+            price = data["bitcoin"]["usd"]
+            channel = bot.get_channel(BTC_PRICE_CHANNEL_ID)
+            if channel and isinstance(channel, discord.VoiceChannel):
+                new_name = f"BTC Price: ${price:,.0f}"
+                if channel.name != new_name:
+                    await channel.edit(name=new_name)
+                    logger.info(f"Updated BTC price channel: {new_name}")
+    except Exception as e:
+        logger.error(f"Error updating BTC price: {e}")
+
+async def update_eth_price():
+    if ETH_PRICE_CHANNEL_ID == 0:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await fetch_json(session, "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
+            price = data["ethereum"]["usd"]
+            channel = bot.get_channel(ETH_PRICE_CHANNEL_ID)
+            if channel and isinstance(channel, discord.VoiceChannel):
+                new_name = f"ETH Price: ${price:,.0f}"
+                if channel.name != new_name:
+                    await channel.edit(name=new_name)
+                    logger.info(f"Updated ETH price channel: {new_name}")
+    except Exception as e:
+        logger.error(f"Error updating ETH price: {e}")
+
+async def update_fng():
+    if FNG_CHANNEL_ID == 0:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Fear & Greed index API (alternative reliable source)
+            data = await fetch_json(session, "https://api.alternative.me/fng/?limit=1")
+            value = data["data"][0]["value"]
+            channel = bot.get_channel(FNG_CHANNEL_ID)
+            if channel and isinstance(channel, discord.VoiceChannel):
+                new_name = f"Fear & Greed: {value}"
+                if channel.name != new_name:
+                    await channel.edit(name=new_name)
+                    logger.info(f"Updated Fear & Greed channel: {new_name}")
+    except Exception as e:
+        logger.error(f"Error updating Fear & Greed: {e}")
+
+async def update_btc_vol():
+    if BTC_VOL_CHANNEL_ID == 0:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await fetch_json(session, "https://api.coingecko.com/api/v3/coins/bitcoin")
+            vol = data["market_data"]["total_volume"]["usd"]
+            channel = bot.get_channel(BTC_VOL_CHANNEL_ID)
+            if channel and isinstance(channel, discord.VoiceChannel):
+                vol_mil = vol / 1_000_000
+                new_name = f"BTC Vol: ${vol_mil:,.0f}M"
+                if channel.name != new_name:
+                    await channel.edit(name=new_name)
+                    logger.info(f"Updated BTC Vol channel: {new_name}")
+    except Exception as e:
+        logger.error(f"Error updating BTC Vol: {e}")
+
+async def update_eth_vol():
+    if ETH_VOL_CHANNEL_ID == 0:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await fetch_json(session, "https://api.coingecko.com/api/v3/coins/ethereum")
+            vol = data["market_data"]["total_volume"]["usd"]
+            channel = bot.get_channel(ETH_VOL_CHANNEL_ID)
+            if channel and isinstance(channel, discord.VoiceChannel):
+                vol_mil = vol / 1_000_000
+                new_name = f"ETH Vol: ${vol_mil:,.0f}M"
+                if channel.name != new_name:
+                    await channel.edit(name=new_name)
+                    logger.info(f"Updated ETH Vol channel: {new_name}")
+    except Exception as e:
+        logger.error(f"Error updating ETH Vol: {e}")
+
+# ===== Scheduled updates for prices and volumes =====
+
+@tasks.loop(minutes=6)
+async def update_prices():
+    await asyncio.gather(
+        update_btc_price(),
+        update_eth_price(),
+    )
+
+@tasks.loop(minutes=45)
+async def update_fng_task():
+    await update_fng()
+
+@tasks.loop(minutes=15)
+async def update_volumes():
+    await asyncio.gather(
+        update_btc_vol(),
+        update_eth_vol(),
+    )
 
 # ===== Startup =====
 @bot.event
 async def on_ready():
-    logger.info("Bot started as %s", bot.user)
+    logger.info(f"Bot started as {bot.user}")
     if not update_sessions.is_running():
         update_sessions.start()
-    if not update_btc_eth_prices_loop.is_running():
-        update_btc_eth_prices_loop.start()
-    if not update_fng_loop.is_running():
-        update_fng_loop.start()
-    if not update_volumes_loop.is_running():
-        update_volumes_loop.start
+    if not update_prices.is_running():
+        update_prices.start()
+    if not update_fng_task.is_running():
+        update_fng_task.start()
+    if not update_volumes.is_running():
+        update_volumes.start()
     if HEALTH_URL and not ping_health.is_running():
         ping_health.start()
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN not set")
